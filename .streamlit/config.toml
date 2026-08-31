@@ -1,0 +1,34 @@
+[theme]
+base = "light"
+primaryColor = "#003781"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#EEF7FB"
+textColor = "#002B5C"
+linkColor = "#003781"
+codeTextColor = "#002B5C"
+codeBackgroundColor = "#EEF7FB"
+borderColor = "#C7DDEA"
+dataframeBorderColor = "#C7DDEA"
+dataframeHeaderBackgroundColor = "#E4F3FA"
+font = "sans-serif"
+baseRadius = "8px"
+buttonRadius = "8px"
+showWidgetBorder = true
+showSidebarBorder = true
+chartCategoricalColors = ["#003781", "#005FA8", "#007AB8", "#168CC7", "#4CB7E8", "#7CCBE9", "#004C8C"]
+chartSequentialColors = ["#F3F9FC", "#E4F3FA", "#CBE9F6", "#A9DDF3", "#7CCBE9", "#4CB7E8", "#168CC7", "#0067B1", "#004C8C", "#003781"]
+
+[theme.sidebar]
+backgroundColor = "#F4FAFD"
+secondaryBackgroundColor = "#E4F3FA"
+codeBackgroundColor = "#E4F3FA"
+textColor = "#002B5C"
+primaryColor = "#003781"
+borderColor = "#C7DDEA"
+
+[server]
+maxUploadSize = 4096
+runOnSave = true
+
+[browser]
+gatherUsageStats = false
