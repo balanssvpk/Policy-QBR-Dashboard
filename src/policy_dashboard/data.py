@@ -646,7 +646,7 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
             ORDER BY uw_year
             """,
         )
-        payer_review = _to_frame(
+        payer_review_all = _to_frame(
             connection,
             """
             WITH payer_metrics AS (
@@ -672,9 +672,9 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                      ELSE tpa_fee_usd / gross_premium_usd END AS tpa_to_gross_ratio
             FROM payer_metrics
             ORDER BY gross_premium_usd DESC NULLS LAST
-            LIMIT 25
             """,
         )
+        payer_review = payer_review_all.head(25).copy()
         policy_type_review = _to_frame(
             connection,
             """
@@ -690,7 +690,7 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
             LIMIT 20
             """,
         )
-        mobile_by_payer = _to_frame(
+        mobile_by_payer_all = _to_frame(
             connection,
             """
             WITH mobile_metrics AS (
@@ -713,9 +713,9 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                     AS linked_beneficiary_coverage
             FROM mobile_metrics
             ORDER BY unique_beneficiaries DESC
-            LIMIT 25
             """,
         )
+        mobile_by_payer = mobile_by_payer_all.head(25).copy()
 
         metadata = {
             key: value
@@ -833,8 +833,10 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
         "monthly_country_kpis": monthly_country_kpis,
         "premium_by_year": premium_by_year,
         "payer_review": payer_review,
+        "payer_review_all": payer_review_all,
         "policy_type_review": policy_type_review,
         "mobile_by_payer": mobile_by_payer,
+        "mobile_by_payer_all": mobile_by_payer_all,
         "metadata": metadata,
         "query_ms": round((time.perf_counter() - started) * 1000, 1),
     }

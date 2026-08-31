@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import pandas as pd
@@ -17,6 +18,9 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 ALLIANZ_LOGO_PATH = ROOT / "AZ_Partners_Attached_Descriptor_Positive_RGB_.png"
+GEN_BI_EVALUATION_DIR = Path(
+    os.getenv("GEN_BI_EVALUATION_DIR", str(ROOT / "data" / "gen_bi_evaluations"))
+).expanduser()
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -30,12 +34,14 @@ from policy_dashboard.data import (
 from policy_dashboard.gen_bi import (
     OllamaConfig,
     OllamaServiceStatus,
+    QuestionEvidence,
     ask_ollama,
     available_models,
-    build_context,
-    deterministic_insight,
+    build_question_evidence,
+    evidence_table_label,
     ensure_ollama_server,
     get_ollama_config,
+    record_evaluation,
 )
 
 
@@ -181,7 +187,7 @@ def _cached_snapshot(db_path: str, modified_ns: int, filters_json: str) -> dict[
     return query_dashboard(db_path, FilterSpec.from_dict(json.loads(filters_json)))
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=900, max_entries=128)
 def _cached_ollama_answer(host: str, model: str, question: str, context: str) -> str:
     return ask_ollama(host=host, model=model, question=question, context=context)
 
@@ -979,29 +985,47 @@ def _render_premium(snapshot: dict[str, Any]) -> None:
     )
 
 
+_EVIDENCE_PERCENT_COLUMNS = {
+    "app_penetration_rate",
+    "net_to_gross_ratio",
+    "tpa_to_gross_ratio",
+    "registered_user_penetration",
+    "linked_beneficiary_coverage",
+}
+
+
+def _render_question_evidence(evidence: QuestionEvidence) -> None:
+    with st.expander("Evidence used for this answer", expanded=False):
+        st.caption(
+            f"Focus: {evidence.focus} · Sources: "
+            f"{', '.join(evidence_table_label(source) for source in evidence.source_tables)}"
+        )
+        for limitation in evidence.limitations:
+            st.warning(limitation)
+        for source, frame in evidence.tables.items():
+            st.markdown(f"**{evidence_table_label(source)}**")
+            percent_columns = _EVIDENCE_PERCENT_COLUMNS.intersection(frame.columns)
+            st.dataframe(
+                _format_frame(frame.copy(), percent_columns),
+                width="stretch",
+                hide_index=True,
+                height=min(300, 74 + 35 * max(len(frame), 1)),
+            )
+
+
 def _render_gen_bi(
     snapshot: dict[str, Any],
     filters: FilterSpec,
+    entity_catalog: dict[str, list[Any]],
     ollama_config: OllamaConfig,
     ollama_status: OllamaServiceStatus,
+    evaluation_dir: Path,
 ) -> None:
-    st.subheader("Gen BI — payer and policy review", anchor=False)
+    st.subheader("Gen BI — CXO question review", anchor=False)
     st.caption(
-        "The metric engine calculates the evidence in DuckDB first. Ollama receives only aggregate tables; "
-        "it cannot generate or execute SQL."
+        "Ask a focused business question. The metric engine selects only relevant, aggregate-only evidence; "
+        "Ollama then turns it into an executive answer."
     )
-
-    question = st.text_area(
-        "Ask question:",
-        placeholder="Which payer needs the most attention, and what action should we take?",
-        height=100,
-    )
-
-    with st.expander("Instant evidence-led portfolio readout", expanded=True):
-        try:
-            st.markdown(deterministic_insight(snapshot))
-        except Exception as exc:
-            st.error(f"Insight generation failed: {exc}")
 
     host = ollama_config.host
     configured_model = ollama_config.model
@@ -1010,8 +1034,7 @@ def _render_gen_bi(
 
     if ollama_status.is_available and model_is_available:
         st.caption(
-            f"Using configured local model `{configured_model}`. The model is kept warm for 30 minutes; "
-            "identical questions and scope are cached for 15 minutes."
+            f"Configured local model: `{configured_model}` · Duplicate question-and-scope answers are cached for 15 minutes."
         )
     elif ollama_status.is_available:
         st.warning(
@@ -1021,49 +1044,94 @@ def _render_gen_bi(
     else:
         st.info(ollama_status.message)
 
-    scope = _scope_text(filters)
-    if not scope:
-        scope = "None"
-
-    if st.button(
-        "Generate insights",
-        type="primary",
-        disabled=not bool(question.strip()) or not model_is_available,
-    ):
-        if not model_is_available:
-            st.error("The configured local Ollama model is not available yet.")
-            return
-
-        context = build_context(question, snapshot, scope)
-
-        try:
-            with st.spinner("Drafting a concise, evidence-backed answer locally…"):
-                answer = _cached_ollama_answer(
-                    host, configured_model, question, context
-                )
-            st.markdown(answer)
-        except Exception as exc:
-            st.error(f"Ollama could not complete the request: {exc}")
-
-    st.markdown('<div class="section-label">Evidence sent to the narrative layer</div>', unsafe_allow_html=True)
-
-    evidence_columns = [
-        "payer_name",
-        "beneficiaries",
-        "gross_premium_usd",
-        "net_premium_usd",
-        "tpa_fee_usd",
-        "app_penetration_rate",
-    ]
-
-    evidence = snapshot["payer_review"].loc[:, evidence_columns]
-
-    st.dataframe(
-        _format_frame(evidence, {"app_penetration_rate"}),
-        width="stretch",
-        hide_index=True,
-        height=300,
+    st.caption(
+        "Examples: Compare Allianz and Bupa app penetration; Where is premium growth strongest; "
+        "Which policy type has the highest TPA ratio?"
     )
+    with st.form("gen_bi_question", border=False):
+        question = st.text_area(
+            "Executive question",
+            placeholder="Which payer needs attention, why, and what should we do next?",
+            height=94,
+            max_chars=800,
+        )
+        submitted = st.form_submit_button(
+            "Generate CXO answer",
+            type="primary",
+            width="content",
+            disabled=not model_is_available,
+        )
+    st.caption(
+        "Every submitted interaction is saved locally as an aggregate-only Parquet evaluation record."
+    )
+
+    if not submitted:
+        return
+    if not question.strip():
+        st.warning("Enter a focused business question before generating an answer.")
+        return
+
+    scope = _scope_text(filters) or "All portfolio"
+    planning_started = time.perf_counter()
+    try:
+        evidence = build_question_evidence(
+            question,
+            snapshot,
+            scope,
+            entity_catalog=entity_catalog,
+        )
+    except Exception as exc:
+        st.error(f"The question-to-evidence step could not be completed: {exc}")
+        return
+    planning_ms = round((time.perf_counter() - planning_started) * 1000, 1)
+
+    answer: str | None = None
+    response_status = "success"
+    error_message: str | None = None
+    model_ms: float | None = None
+    try:
+        answer_started = time.perf_counter()
+        with st.spinner("Preparing the CXO answer from the selected evidence…"):
+            answer = _cached_ollama_answer(
+                host,
+                configured_model,
+                evidence.question,
+                evidence.context_json,
+            )
+        model_ms = round((time.perf_counter() - answer_started) * 1000, 1)
+    except Exception as exc:
+        model_ms = round((time.perf_counter() - answer_started) * 1000, 1)
+        response_status = "failed"
+        error_message = str(exc)
+
+    try:
+        record_path = record_evaluation(
+            evaluation_dir=evaluation_dir,
+            evidence=evidence,
+            answer=answer,
+            model=configured_model,
+            response_status=response_status,
+            filter_spec_json=json.dumps(filters.as_dict(), sort_keys=True),
+            planning_ms=planning_ms,
+            model_ms=model_ms,
+            dashboard_query_ms=snapshot.get("query_ms"),
+            error_message=error_message,
+        )
+    except Exception as exc:
+        record_path = None
+        st.warning(f"The answer could not be recorded to the evaluation dataset: {exc}")
+
+    if answer is None:
+        st.error(f"Ollama could not complete the request: {error_message}")
+    else:
+        st.markdown('<div class="section-label">CXO answer</div>', unsafe_allow_html=True)
+        st.markdown(answer)
+
+    if record_path is not None:
+        st.caption(
+            f"Evaluation record saved: `{record_path.name}` · Evidence planning {planning_ms:,.1f} ms"
+        )
+    _render_question_evidence(evidence)
 
 
 
@@ -1075,7 +1143,7 @@ def _render_data_guide(snapshot: dict[str, Any]) -> None:
         - **Active population:** distinct `beneficiarykey` where member start date is on or before a calendar month end and stop date is on or after it.
         - **Mobile App penetration:** distinct `registereduserkey` divided by distinct `beneficiarykey`, as requested. The dashboard separately reports beneficiary linkage for interpretation.
         - **KPI-card MoM / YoY:** calculated against the prior calendar month and the same month one year earlier. GP / NP / TPA are evenly allocated across each policy's active month-end coverage months for these comparisons; detailed premium tables remain policy-year sums.
-        - **Gen BI:** a fixed metric layer produces aggregate evidence; Ollama narrates it and is never allowed to write SQL or receive beneficiary-level rows.
+        - **Gen BI:** a semantic layer maps each question to relevant aggregate evidence; Ollama narrates it in an executive format and is never allowed to write SQL or receive beneficiary-level rows. Each submitted interaction is saved as an aggregate-only Parquet evaluation record.
         """
     )
     st.markdown('<div class="section-label">Mart metadata</div>', unsafe_allow_html=True)
@@ -1138,7 +1206,14 @@ def main() -> None:
     with tabs[3]:
         _render_premium(snapshot)
     with tabs[4]:
-        _render_gen_bi(snapshot, filters, ollama_config, ollama_status)
+        _render_gen_bi(
+            snapshot,
+            filters,
+            options,
+            ollama_config,
+            ollama_status,
+            GEN_BI_EVALUATION_DIR,
+        )
     with tabs[5]:
         _render_data_guide(snapshot)
 

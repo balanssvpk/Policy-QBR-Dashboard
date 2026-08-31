@@ -18,8 +18,9 @@ Raw CSV / Parquet → prepare_data.py → compact DuckDB mart → Streamlit dash
   `beneficiarykey`, plus linked-beneficiary coverage to identify household or
   one-to-many account effects.
 - GP, NP, and TPA fee evaluation by underwriting year, payer, and policy type.
-- A guarded Gen BI page: DuckDB computes the metrics; a local Ollama model
-  converts only aggregate evidence into a concise executive narrative.
+- A guarded Gen BI page: a deterministic semantic router maps each question to
+  only the relevant aggregate metrics, then a local Ollama model produces a
+  concise MBB-style CXO narrative.
 
 ## Quick start (Windows / PowerShell)
 
@@ -76,9 +77,20 @@ For a Lenovo P5 with 128 GB RAM and no GPU, use a small quantized 1–3B model,
 keep it warm, limit the response to ~180 tokens, and retain the cache. The
 dashboard's filter and metric calculations target sub-second warm latency;
 CPU text generation itself is inherently variable and will usually take longer
-than one second for a new answer. The app therefore always displays an instant
-deterministic evidence readout and caches duplicate model requests for 15
-minutes.
+than one second for a new answer. The app therefore prepares the
+question-specific deterministic evidence pack before invoking the model and
+caches duplicate question-and-scope requests for 15 minutes.
+
+## Gen BI evaluation records
+
+Each submitted Gen BI question writes one aggregate-only Parquet interaction
+row under `data/gen_bi_evaluations/date=YYYY-MM-DD/`. The record includes the
+UTC timestamp, question, semantic focus, selected sources and entities,
+applied filter scope, question-specific evidence supplied to Ollama, all
+available aggregate metric values, model answer/status, and timing measures.
+The output is ignored by Git because it may contain internal business
+questions and summaries. Set `GEN_BI_EVALUATION_DIR` to redirect the local
+Parquet dataset.
 
 ## Data and privacy controls
 
@@ -86,6 +98,8 @@ minutes.
 - The Streamlit process receives only aggregated tables for visualizations.
 - Ollama receives a compact aggregate briefing only—never beneficiary keys,
   policy-level records, or arbitrary model-written SQL.
+- Gen BI evaluation records persist only aggregate metrics and local business
+  question/answer text; they never include policy or beneficiary records.
 - The app expects currency values to already be USD, as named in the source.
 
 ## Performance design

@@ -33,6 +33,11 @@ def test_reset_filters_clears_widget_values_and_applied_scope(
     assert "Local Ollama model" not in [
         selectbox.label for selectbox in app.selectbox
     ]
+    assert "Gen BI — CXO question review" in [
+        subheader.value for subheader in app.subheader
+    ]
+    assert "Generate CXO answer" in [button.label for button in app.button]
+    assert "Generate insights" not in [button.label for button in app.button]
     assert any(
         markdown.value == "**Filters applied:** None"
         for markdown in app.sidebar.markdown
