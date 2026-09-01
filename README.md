@@ -56,10 +56,10 @@ python -m streamlit run app.py
 
 ## Ollama setup
 
-Install Ollama locally and pull the model configured in `.env`. The dashboard
-checks the configured endpoint at startup and starts `ollama serve`
-automatically when the local service is not already running. It does not pull
-models automatically.
+Install Ollama using your normal operating-system setup and pull the model
+configured in `.env`. The dashboard never starts, stops, or otherwise manages
+the Ollama service; the configured endpoint must already be available. It does
+not pull models automatically.
 
 ```dotenv
 OLLAMA_HOST=http://127.0.0.1:11434
@@ -73,13 +73,20 @@ ollama pull llama3.2:1b
 python -m streamlit run app.py
 ```
 
+Use **Check model response** in the Gen BI page to send the configured model a
+small `READY` prompt. The same probe runs only after a Gen BI narration fails,
+so it distinguishes an unavailable model from a prompt-specific problem without
+adding model work to normal dashboard reruns.
+
 For a Lenovo P5 with 128 GB RAM and no GPU, use a small quantized 1–3B model,
 keep it warm, limit the response to ~180 tokens, and retain the cache. The
 dashboard's filter and metric calculations target sub-second warm latency;
 CPU text generation itself is inherently variable and will usually take longer
 than one second for a new answer. The app therefore prepares the
-question-specific deterministic evidence pack before invoking the model and
-caches duplicate question-and-scope requests for 15 minutes.
+question-specific deterministic evidence pack before invoking the model, limits
+the model briefing and completion size, and caches duplicate question-and-scope
+requests for 15 minutes. If Ollama does not respond, Gen BI reports the probe
+result and returns an evidence-bound deterministic fallback.
 
 ## Gen BI evaluation records
 

@@ -147,11 +147,13 @@ def test_record_evaluation_writes_aggregate_parquet_row(tmp_path: Path) -> None:
         evaluation_dir=tmp_path / "gen_bi_evaluations",
         evidence=evidence,
         answer="**Executive answer** Group requires attention.",
-        model="llama3.2:1b",
+        response_engine="ollama:llama3.2:1b",
         response_status="success",
+        configured_model="llama3.2:1b",
+        model_check_status="narrative_responded",
         filter_spec_json='{"payer_countries":["Egypt"]}',
         planning_ms=1.5,
-        model_ms=340.2,
+        response_ms=340.2,
         dashboard_query_ms=12.4,
     )
 
@@ -161,6 +163,8 @@ def test_record_evaluation_writes_aggregate_parquet_row(tmp_path: Path) -> None:
     assert saved.loc[0, "question"] == evidence.question
     assert saved.loc[0, "answer"].startswith("**Executive answer**")
     assert saved.loc[0, "response_status"] == "success"
+    assert saved.loc[0, "configured_model"] == "llama3.2:1b"
+    assert saved.loc[0, "model_check_status"] == "narrative_responded"
     assert pd.notna(saved.loc[0, "timestamp_utc"])
 
     all_metrics = json.loads(saved.loc[0, "all_aggregate_metrics_json"])

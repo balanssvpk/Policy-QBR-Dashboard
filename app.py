@@ -1,4 +1,4 @@
-"""CXO-level Policy QBR dashboard."""
+"""C-level Policy QBR dashboard."""
 
 from __future__ import annotations
 
@@ -32,14 +32,15 @@ from policy_dashboard.data import (
     query_dashboard,
 )
 from policy_dashboard.gen_bi import (
-    OllamaConfig,
-    OllamaServiceStatus,
+    DETERMINISTIC_ENGINE,
+    OLLAMA_ENGINE,
+    OllamaModelStatus,
     QuestionEvidence,
     ask_ollama,
-    available_models,
     build_question_evidence,
+    check_ollama_model_response,
     evidence_table_label,
-    ensure_ollama_server,
+    generate_executive_answer,
     get_ollama_config,
     record_evaluation,
 )
@@ -71,8 +72,7 @@ st.markdown("""
         /* Remove the Deploy button */
         .stDeployButton {display: none !important;}
 
-        /* Optional: remove Streamlit header and footer */
-        header {visibility: hidden;}
+        /* Keep the header available for Streamlit's sidebar reopen control. */
         footer {visibility: hidden;}
     </style>
 """, unsafe_allow_html=True)
@@ -169,6 +169,18 @@ def _inject_css() -> None:
           .stTabs [aria-selected="true"] { color: #11263E; border-bottom-color: #00A6A6; }
           .stButton > button { border-radius: 6px; font-weight: 650; }
           [data-testid="stDataFrame"] { border: 1px solid #E1E6EA; border-radius: 8px; overflow: hidden; }
+          /* Streamlit renders expander chevrons as Material-icon spans, not SVGs. */
+          [data-testid="stSidebar"] [data-testid="stExpander"] > details > summary [data-testid="stIconMaterial"] {
+            color: #0067B1 !important;
+            opacity: 1 !important;
+          }
+          [data-testid="stSidebar"] [data-testid="stExpander"] > details:not([open]) > summary [data-testid="stIconMaterial"] {
+            background: #003781 !important;
+            color: #E4F3FA !important;
+            border-radius: 999px;
+            box-shadow: 0 0 0 1px #003781;
+            opacity: 1 !important;
+          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -188,8 +200,17 @@ def _cached_snapshot(db_path: str, modified_ns: int, filters_json: str) -> dict[
 
 
 @st.cache_data(show_spinner=False, ttl=900, max_entries=128)
-def _cached_ollama_answer(host: str, model: str, question: str, context: str) -> str:
-    return ask_ollama(host=host, model=model, question=question, context=context)
+def _cached_ollama_answer(
+    host: str, model: str, question: str, context_json: str
+) -> str:
+    """Cache repeated aggregate-only Gen BI requests for a short, bounded window."""
+
+    return ask_ollama(
+        host=host,
+        model=model,
+        question=question,
+        context_json=context_json,
+    )
 
 
 def _compact_money(value: Any) -> str:
@@ -556,6 +577,7 @@ def _render_sidebar(options: dict[str, list[Any]]) -> FilterSpec:
     with st.sidebar:
         if ALLIANZ_LOGO_PATH.is_file():
             st.image(str(ALLIANZ_LOGO_PATH), width="stretch")
+            st.divider( width="stretch")
         st.markdown("### Data Filters:")
         # st.caption("Apply a common scope across every page. Filters run only when applied.")
         with st.form("portfolio_filters", border=False):
@@ -563,7 +585,8 @@ def _render_sidebar(options: dict[str, list[Any]]) -> FilterSpec:
             for group_label, attributes in FILTER_GROUPS:
                 with st.expander(
                     group_label,
-                    expanded=group_label == "Portfolio & contract",
+                    expanded=False,
+                    # expanded=group_label == "Portfolio & contract",
                 ):
                     for attribute in attributes:
                         selected_dimensions[attribute] = st.multiselect(
@@ -596,22 +619,23 @@ def _render_sidebar(options: dict[str, list[Any]]) -> FilterSpec:
                 },
             )
             st.session_state["applied_filters"] = applied
-        st.divider()
+        st.divider(width = "stretch")
         st.caption("Data controls")
         st.caption("• Aggregates only leave the mart for Gen BI")
         st.caption("• The raw source is not loaded into the browser")
         scope = _scope_text(applied) or "None"
         st.markdown(f"**Filters applied:** {scope}")
+
     return applied
 
 
 def _render_header() -> None:
     st.markdown(
-        '<div class="qbr-kicker">POLICY PORTFOLIO / QUARTERLY BUSINESS REVIEW</div>',
+        '<div class="qbr-kicker">POLICY PORTFOLIO / BUSINESS REVIEW</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="qbr-title">Executive policy command centre</div>',
+        '<div class="qbr-title">Portfolio performance center</div>',
         unsafe_allow_html=True,
     )
 
@@ -799,20 +823,30 @@ def _render_overview(snapshot: dict[str, Any]) -> None:
                     "tpa_fee_usd": "TPA fee",
                 }
             )
-            figure = px.line(
+            figure = px.bar(
                 melted,
                 x="uw_year",
                 y="usd",
                 color="metric",
-                markers=True,
+                barmode="group",
+                text=[
+                    f"{v:,.0f}" if pd.notna(v) else ""
+                    for v in melted["usd"]
+                ],
                 color_discrete_map={
                     "Gross premium": PALETTE["navy"],
                     "Net premium": PALETTE["teal"],
                     "TPA fee": PALETTE["amber"],
                 },
             )
+
+            figure.update_traces(
+                textposition="outside",
+                cliponaxis=False
+            )
+
             figure.update_layout(
-                height=390,
+                height=350,
                 margin=dict(l=0, r=10, t=25, b=0),
                 legend_title_text="",
                 paper_bgcolor="#FFFFFF",
@@ -832,27 +866,38 @@ def _render_overview(snapshot: dict[str, Any]) -> None:
                 y="payer_name",
                 orientation="h",
                 color_discrete_sequence=[PALETTE["teal"]],
+                text=[
+                    f"{v:,.0f}" if pd.notna(v) else ""
+                    for v in payers.sort_values("gross_premium_usd")["gross_premium_usd"]
+                ],
             )
+
+            figure.update_traces(
+                textposition="outside",
+                cliponaxis=False
+            )
+
             figure.update_layout(
-                height=315,
+                height=350,
                 margin=dict(l=0, r=10, t=25, b=0),
                 paper_bgcolor="#FFFFFF",
                 plot_bgcolor="#FFFFFF",
                 xaxis_title="Gross premium (USD)",
                 yaxis_title="",
             )
+
             st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
 
-    st.markdown('<div class="section-label">Payer review</div>', unsafe_allow_html=True)
-    st.dataframe(
-        _format_frame(
-            snapshot["payer_review"].copy(),
-            {"app_penetration_rate", "net_to_gross_ratio", "tpa_to_gross_ratio"},
-        ),
-        width="stretch",
-        hide_index=True,
-        height=360,
-    )
+    # st.markdown('<div class="section-label">Payer review</div>', unsafe_allow_html=True)
+    # st.dataframe(
+    #     _format_frame(
+    #         snapshot["payer_review"].copy(),
+    #         {"app_penetration_rate", "net_to_gross_ratio", "tpa_to_gross_ratio"},
+    #     ),
+    #     width="stretch",
+    #     hide_index=True,
+    #     height=360,
+    # )
 
 
 def _render_population(snapshot: dict[str, Any]) -> None:
@@ -1017,32 +1062,43 @@ def _render_gen_bi(
     snapshot: dict[str, Any],
     filters: FilterSpec,
     entity_catalog: dict[str, list[Any]],
-    ollama_config: OllamaConfig,
-    ollama_status: OllamaServiceStatus,
     evaluation_dir: Path,
 ) -> None:
-    st.subheader("Gen BI — CXO question review", anchor=False)
+    ollama_config = get_ollama_config(ROOT / ".env")
+    model_status_key = "gen_bi_ollama_model_status"
+
+    st.subheader("Gen BI — user question review", anchor=False)
     st.caption(
-        "Ask a focused business question. The metric engine selects only relevant, aggregate-only evidence; "
-        "Ollama then turns it into an executive answer."
+        "Ask a focused business question. A deterministic semantic layer selects only relevant, "
+        "aggregate-only evidence; the configured Ollama model turns it into a concise business narrative."
     )
+    st.caption(
+        f"Configured model: `{ollama_config.model}` · Endpoint: `{ollama_config.host}` · "
+        "The dashboard never starts or manages the Ollama service."
+    )
+    if st.button(
+        "Check model response",
+        key="gen_bi_model_response_check",
+        icon=":material/health_and_safety:",
+        width="content",
+    ):
+        with st.spinner("Sending a small response check to the configured model..."):
+            st.session_state[model_status_key] = check_ollama_model_response(
+                ollama_config.host,
+                ollama_config.model,
+            )
 
-    host = ollama_config.host
-    configured_model = ollama_config.model
-    models = available_models(host) if ollama_status.is_available else []
-    model_is_available = configured_model in models
-
-    if ollama_status.is_available and model_is_available:
-        st.caption(
-            f"Configured local model: `{configured_model}` · Duplicate question-and-scope answers are cached for 15 minutes."
+    prior_model_status = st.session_state.get(model_status_key)
+    if isinstance(prior_model_status, OllamaModelStatus):
+        status_suffix = (
+            f" ({prior_model_status.latency_ms:,.1f} ms)"
+            if prior_model_status.latency_ms is not None
+            else ""
         )
-    elif ollama_status.is_available:
-        st.warning(
-            f"Configured model `{configured_model}` is not installed. Run `ollama pull {configured_model}` "
-            "to enable narrative answers."
-        )
-    else:
-        st.info(ollama_status.message)
+        if prior_model_status.is_responding:
+            st.success(f"Model check passed: {prior_model_status.message}{status_suffix}")
+        else:
+            st.error(f"Model check failed: {prior_model_status.message}{status_suffix}")
 
     st.caption(
         "Examples: Compare Allianz and Bupa app penetration; Where is premium growth strongest; "
@@ -1056,10 +1112,9 @@ def _render_gen_bi(
             max_chars=800,
         )
         submitted = st.form_submit_button(
-            "Generate CXO answer",
+            "Generate Insight",
             type="primary",
             width="content",
-            disabled=not model_is_available,
         )
     st.caption(
         "Every submitted interaction is saved locally as an aggregate-only Parquet evaluation record."
@@ -1087,33 +1142,56 @@ def _render_gen_bi(
 
     answer: str | None = None
     response_status = "success"
+    response_engine = f"{OLLAMA_ENGINE}:{ollama_config.model}"
+    model_check_status = "narrative_responded"
     error_message: str | None = None
-    model_ms: float | None = None
+    response_ms: float | None = None
+    model_status: OllamaModelStatus | None = None
+    answer_started = time.perf_counter()
     try:
-        answer_started = time.perf_counter()
-        with st.spinner("Preparing the CXO answer from the selected evidence…"):
+        with st.spinner(f"Generating a business response with {ollama_config.model}..."):
             answer = _cached_ollama_answer(
-                host,
-                configured_model,
+                ollama_config.host,
+                ollama_config.model,
                 evidence.question,
                 evidence.context_json,
             )
-        model_ms = round((time.perf_counter() - answer_started) * 1000, 1)
     except Exception as exc:
-        model_ms = round((time.perf_counter() - answer_started) * 1000, 1)
-        response_status = "failed"
-        error_message = str(exc)
+        with st.spinner("Confirming the configured model with a minimal response check..."):
+            model_status = check_ollama_model_response(
+                ollama_config.host,
+                ollama_config.model,
+            )
+        st.session_state[model_status_key] = model_status
+        model_check_status = (
+            "simple_probe_responded"
+            if model_status.is_responding
+            else "simple_probe_failed"
+        )
+        error_message = (
+            f"Gen BI model call failed: {exc} Model response check: {model_status.message}"
+        )
+        try:
+            answer = generate_executive_answer(evidence)
+            response_status = "fallback"
+            response_engine = DETERMINISTIC_ENGINE
+        except Exception as fallback_exc:
+            response_status = "failed"
+            error_message = f"{error_message} Deterministic fallback failed: {fallback_exc}"
+    response_ms = round((time.perf_counter() - answer_started) * 1000, 1)
 
     try:
         record_path = record_evaluation(
             evaluation_dir=evaluation_dir,
             evidence=evidence,
             answer=answer,
-            model=configured_model,
+            response_engine=response_engine,
             response_status=response_status,
+            configured_model=ollama_config.model,
+            model_check_status=model_check_status,
             filter_spec_json=json.dumps(filters.as_dict(), sort_keys=True),
             planning_ms=planning_ms,
-            model_ms=model_ms,
+            response_ms=response_ms,
             dashboard_query_ms=snapshot.get("query_ms"),
             error_message=error_message,
         )
@@ -1122,14 +1200,21 @@ def _render_gen_bi(
         st.warning(f"The answer could not be recorded to the evaluation dataset: {exc}")
 
     if answer is None:
-        st.error(f"Ollama could not complete the request: {error_message}")
+        st.error(f"The Gen BI response could not be completed: {error_message}")
     else:
-        st.markdown('<div class="section-label">CXO answer</div>', unsafe_allow_html=True)
+        if response_status == "fallback":
+            st.warning(
+                "The configured model did not produce a Gen BI response. "
+                f"{model_status.message if model_status else error_message} "
+                "Showing the evidence-bound deterministic fallback instead."
+            )
+        st.markdown('<div class="section-label">Insight:</div>', unsafe_allow_html=True)
         st.markdown(answer)
 
     if record_path is not None:
         st.caption(
-            f"Evaluation record saved: `{record_path.name}` · Evidence planning {planning_ms:,.1f} ms"
+            f"Evaluation record saved: `{record_path.name}` · Engine `{response_engine}` · "
+            f"Evidence planning {planning_ms:,.1f} ms · Response {response_ms:,.1f} ms"
         )
     _render_question_evidence(evidence)
 
@@ -1143,7 +1228,7 @@ def _render_data_guide(snapshot: dict[str, Any]) -> None:
         - **Active population:** distinct `beneficiarykey` where member start date is on or before a calendar month end and stop date is on or after it.
         - **Mobile App penetration:** distinct `registereduserkey` divided by distinct `beneficiarykey`, as requested. The dashboard separately reports beneficiary linkage for interpretation.
         - **KPI-card MoM / YoY:** calculated against the prior calendar month and the same month one year earlier. GP / NP / TPA are evenly allocated across each policy's active month-end coverage months for these comparisons; detailed premium tables remain policy-year sums.
-        - **Gen BI:** a semantic layer maps each question to relevant aggregate evidence; Ollama narrates it in an executive format and is never allowed to write SQL or receive beneficiary-level rows. Each submitted interaction is saved as an aggregate-only Parquet evaluation record.
+        - **Gen BI:** a deterministic semantic layer maps each question to relevant aggregate evidence, then the configured Ollama model produces the business narrative. It never writes SQL or receives beneficiary-level rows. The dashboard never starts or manages Ollama; if a narration fails, it runs a tiny model-response probe and returns an evidence-bound fallback. Each submitted interaction is saved as an aggregate-only Parquet evaluation record.
         """
     )
     st.markdown('<div class="section-label">Mart metadata</div>', unsafe_allow_html=True)
@@ -1153,14 +1238,12 @@ def _render_data_guide(snapshot: dict[str, Any]) -> None:
     st.dataframe(metadata_frame, width="stretch", hide_index=True)
     st.caption(
         f"Latest dashboard query: {snapshot['query_ms']:,.1f} ms. This measures DuckDB aggregation only, "
-        "not browser rendering or Ollama inference."
+        "not browser rendering or the deterministic Gen BI response step."
     )
 
 
 def main() -> None:
     _inject_css()
-    ollama_config = get_ollama_config(ROOT / ".env")
-    ollama_status = ensure_ollama_server(ollama_config.host)
     db_path = Path(
         os.getenv("POLICY_MART_PATH", str(ROOT / "data" / "policy_mart.duckdb"))
     ).expanduser()
@@ -1210,8 +1293,6 @@ def main() -> None:
             snapshot,
             filters,
             options,
-            ollama_config,
-            ollama_status,
             GEN_BI_EVALUATION_DIR,
         )
     with tabs[5]:

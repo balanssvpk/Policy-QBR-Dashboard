@@ -1,4 +1,4 @@
-"""Safe, aggregate-only Ollama narration for the Gen BI sheet."""
+"""Fast, deterministic, aggregate-only Gen BI responses for the CXO sheet."""
 
 from __future__ import annotations
 
@@ -8,38 +8,19 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
-import threading
-import time
+from time import perf_counter
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlparse
 from uuid import uuid4
 
 import pandas as pd
 import requests
 
 
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "llama3.2:1b"
-_DOTENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
-_LOCAL_OLLAMA_HOSTS = {"127.0.0.1", "localhost", "::1"}
-_OLLAMA_LAUNCH_COOLDOWN_SECONDS = 10.0
-_ollama_launch_lock = threading.Lock()
-_ollama_launch_attempts: dict[str, float] = {}
-
-
-@dataclass(frozen=True)
-class OllamaConfig:
-    host: str
-    model: str
-
-
-@dataclass(frozen=True)
-class OllamaServiceStatus:
-    is_available: bool
-    launch_attempted: bool
-    message: str
+DETERMINISTIC_ENGINE = "deterministic-cxo-engine-v1"
+OLLAMA_ENGINE = "ollama"
+_DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+_DEFAULT_OLLAMA_MODEL = "llama3.2:1b"
+_MAX_MODEL_CONTEXT_CHARS = 18_000
 
 
 @dataclass
@@ -57,6 +38,238 @@ class QuestionEvidence:
     limitations: tuple[str, ...]
     context_json: str
     all_metrics_json: str
+
+
+@dataclass(frozen=True)
+class OllamaConfig:
+    """Configured endpoint and model for the optional local narrator."""
+
+    host: str
+    model: str
+
+
+@dataclass(frozen=True)
+class OllamaModelStatus:
+    """Result of a real, minimal model-generation probe."""
+
+    is_responding: bool
+    message: str
+    latency_ms: float | None = None
+    sample_response: str | None = None
+
+
+class OllamaResponseError(RuntimeError):
+    """Raised when Ollama cannot return a usable model response."""
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """Read the few configuration values needed without a dotenv dependency."""
+
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, separator, value = line.partition("=")
+        if not separator or not key.strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def get_ollama_config(env_file: str | Path | None = None) -> OllamaConfig:
+    """Read `.env` defaults, with process environment taking precedence."""
+
+    path = (
+        Path(env_file)
+        if env_file is not None
+        else Path(__file__).resolve().parents[2] / ".env"
+    )
+    dotenv = _read_dotenv(path)
+    host = (
+        os.getenv("OLLAMA_HOST")
+        or dotenv.get("OLLAMA_HOST")
+        or _DEFAULT_OLLAMA_HOST
+    ).strip().rstrip("/")
+    model = (
+        os.getenv("OLLAMA_MODEL")
+        or dotenv.get("OLLAMA_MODEL")
+        or _DEFAULT_OLLAMA_MODEL
+    ).strip()
+    return OllamaConfig(
+        host=host or _DEFAULT_OLLAMA_HOST,
+        model=model or _DEFAULT_OLLAMA_MODEL,
+    )
+
+
+def _ollama_generate(
+    *,
+    host: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    timeout_seconds: float,
+    keep_alive: str,
+) -> str:
+    """Make one non-streaming generation request; never starts a server."""
+
+    endpoint = f"{host.rstrip('/')}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": keep_alive,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": max_tokens,
+            "num_ctx": 4096,
+        },
+    }
+    try:
+        response = requests.post(
+            endpoint,
+            json=payload,
+            timeout=(3.0, max(1.0, float(timeout_seconds))),
+        )
+    except requests.RequestException as exc:
+        raise OllamaResponseError(
+            f"No response from configured Ollama endpoint {host}: {exc}"
+        ) from exc
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise OllamaResponseError(
+            f"Ollama returned a non-JSON response (HTTP {response.status_code})."
+        ) from exc
+
+    if response.status_code >= 400:
+        detail = body.get("error") if isinstance(body, dict) else None
+        raise OllamaResponseError(
+            f"Ollama rejected model '{model}' (HTTP {response.status_code}): "
+            f"{detail or 'unknown error'}"
+        )
+
+    answer = body.get("response") if isinstance(body, dict) else None
+    answer = str(answer or "").strip()
+    if not answer:
+        detail = body.get("error") if isinstance(body, dict) else None
+        raise OllamaResponseError(
+            f"Model '{model}' returned no text{f': {detail}' if detail else ''}."
+        )
+    return answer
+
+
+# def build_ollama_prompt(question: str, context_json: str) -> str:
+#     """Create a compact, evidence-bound CXO prompt from aggregate data only."""
+
+#     context = str(context_json or "").strip()
+#     if len(context) > _MAX_MODEL_CONTEXT_CHARS:
+#         context = context[:_MAX_MODEL_CONTEXT_CHARS] + "\n[Evidence truncated after aggregate rows.]"
+#     return (
+#         "You are an insurance strategy consultant preparing a concise CXO answer.\n"
+#         "Use only the aggregate evidence below. Do not infer missing figures, write SQL, "
+#         "or mention data you were not given.\n"
+#         "Return Markdown with exactly these sections: Executive answer, Evidence, and "
+#         "Recommended actions. Make the answer decision-oriented, factual, and under 190 words.\n\n"
+#         f"Executive question:\n{question.strip()}\n\n"
+#         f"Aggregate evidence (JSON):\n{context}"
+#     )
+
+def build_ollama_prompt(question: str, context_json: str) -> str:
+    """
+    Create a governed CXO‑grade prompt for aggregate‑only Generative BI.
+    Ensures: no hallucination, no SQL, no invented metrics, no raw‑data inference.
+    """
+
+    context = str(context_json or "").strip()
+    if len(context) > _MAX_MODEL_CONTEXT_CHARS:
+        context = (
+            context[:_MAX_MODEL_CONTEXT_CHARS]
+            + "\n[Aggregate evidence truncated due to size.]"
+        )
+
+    return (
+        "You are a senior analytics strategist preparing a concise CXO‑grade answer. "
+        "Use ONLY the aggregate metrics and tables provided. Do not infer missing values, "
+        "do not reference raw data, and do not generate SQL.\n\n"
+        "Your response MUST be under 190 words and MUST contain exactly three Markdown "
+        "sections in this order:\n"
+        "1. **Executive answer** — A direct, decision‑ready conclusion grounded only in the evidence.\n"
+        "2. **Evidence used** — Cite the specific aggregate fields and values that support your answer.\n"
+        "3. **Recommended actions** — 2–4 practical next steps.\n\n"
+        "Guidelines:\n"
+        "- Be factual, concise, and quantitative.\n"
+        "- If evidence is insufficient, state the limitation explicitly.\n"
+        "- Do not speculate or invent metrics.\n"
+        "- Maintain an executive consulting tone.\n\n"
+        f"Executive question:\n{question.strip()}\n\n"
+        f"Aggregate evidence (JSON):\n{context}"
+    )
+
+
+
+def ask_ollama(
+    *,
+    host: str,
+    model: str,
+    question: str,
+    context_json: str,
+    timeout_seconds: float = 45.0,
+) -> str:
+    """Generate a concise narrative from a question-specific aggregate briefing."""
+
+    return _ollama_generate(
+        host=host,
+        model=model,
+        prompt=build_ollama_prompt(question, context_json),
+        max_tokens=220,
+        timeout_seconds=timeout_seconds,
+        keep_alive="10m",
+    )
+
+
+def check_ollama_model_response(
+    host: str,
+    model: str,
+    *,
+    timeout_seconds: float = 20.0,
+) -> OllamaModelStatus:
+    """Confirm that the configured model can generate text with a tiny probe.
+
+    This intentionally performs a real model call instead of checking only the
+    HTTP endpoint. It does not launch, stop, or otherwise manage Ollama.
+    """
+
+    started = perf_counter()
+    try:
+        sample = _ollama_generate(
+            host=host,
+            model=model,
+            prompt="Reply with READY only.",
+            max_tokens=4,
+            timeout_seconds=timeout_seconds,
+            keep_alive="1m",
+        )
+    except OllamaResponseError as exc:
+        return OllamaModelStatus(
+            is_responding=False,
+            message=str(exc),
+            latency_ms=round((perf_counter() - started) * 1000, 1),
+        )
+    return OllamaModelStatus(
+        is_responding=True,
+        message=f"Configured model '{model}' responded successfully.",
+        latency_ms=round((perf_counter() - started) * 1000, 1),
+        sample_response=sample,
+    )
 
 
 _METRIC_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -145,137 +358,6 @@ _TABLE_LABELS = {
 }
 
 
-def _read_dotenv(path: Path) -> dict[str, str]:
-    """Read simple KEY=VALUE pairs without adding a runtime dependency."""
-
-    if not path.exists():
-        return {}
-
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = _DOTENV_LINE.match(line)
-        if not match:
-            continue
-        key, raw_value = match.groups()
-        value = raw_value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        else:
-            value = value.split(" #", maxsplit=1)[0].strip()
-        values[key] = value
-    return values
-
-
-def get_ollama_config(env_path: str | Path) -> OllamaConfig:
-    """Resolve local .env values, allowing explicit process env overrides."""
-
-    values = _read_dotenv(Path(env_path))
-    host = os.getenv("OLLAMA_HOST") or values.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
-    model = os.getenv("OLLAMA_MODEL") or values.get("OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL
-    return OllamaConfig(host=host.strip().rstrip("/"), model=model.strip())
-
-
-def ollama_server_available(host: str, timeout_seconds: float = 0.25) -> bool:
-    """Return whether an Ollama API is already serving at the configured endpoint."""
-
-    try:
-        response = requests.get(
-            f"{host.rstrip('/')}/api/version", timeout=timeout_seconds
-        )
-        response.raise_for_status()
-        return True
-    except requests.RequestException:
-        return False
-
-
-def _local_ollama_bind_address(host: str) -> str | None:
-    parsed = urlparse(host if "://" in host else f"http://{host}")
-    if parsed.hostname not in _LOCAL_OLLAMA_HOSTS or not parsed.netloc:
-        return None
-    return parsed.netloc
-
-
-def ensure_ollama_server(
-    host: str, startup_timeout_seconds: float = 2.0
-) -> OllamaServiceStatus:
-    """Check Ollama, launching a missing local service once per process window."""
-
-    if ollama_server_available(host):
-        return OllamaServiceStatus(True, False, "Ollama is ready.")
-
-    bind_address = _local_ollama_bind_address(host)
-    if bind_address is None:
-        return OllamaServiceStatus(
-            False,
-            False,
-            f"Ollama is not reachable at {host}. Automatic startup is limited to local hosts.",
-        )
-
-    executable = shutil.which("ollama")
-    if executable is None:
-        return OllamaServiceStatus(
-            False,
-            False,
-            "Ollama is not installed or is not available on PATH.",
-        )
-
-    with _ollama_launch_lock:
-        if ollama_server_available(host):
-            return OllamaServiceStatus(True, False, "Ollama is ready.")
-
-        now = time.monotonic()
-        last_attempt = _ollama_launch_attempts.get(host)
-        if (
-            last_attempt is not None
-            and now - last_attempt < _OLLAMA_LAUNCH_COOLDOWN_SECONDS
-        ):
-            return OllamaServiceStatus(
-                False,
-                True,
-                "Ollama is still starting. Refresh shortly if it remains unavailable.",
-            )
-
-        _ollama_launch_attempts[host] = now
-        launch_env = os.environ.copy()
-        launch_env["OLLAMA_HOST"] = bind_address
-        launch_options: dict[str, Any] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "env": launch_env,
-        }
-        if os.name == "nt":
-            launch_options["creationflags"] = getattr(
-                subprocess, "CREATE_NO_WINDOW", 0
-            )
-        else:
-            launch_options["start_new_session"] = True
-
-        try:
-            subprocess.Popen([executable, "serve"], **launch_options)
-        except OSError as exc:
-            return OllamaServiceStatus(
-                False,
-                False,
-                f"Ollama could not be started: {exc}",
-            )
-
-    deadline = time.monotonic() + startup_timeout_seconds
-    while time.monotonic() < deadline:
-        if ollama_server_available(host):
-            return OllamaServiceStatus(True, True, "Ollama started successfully.")
-        time.sleep(0.1)
-
-    return OllamaServiceStatus(
-        False,
-        True,
-        "Ollama was started and is still warming up. Refresh shortly to continue.",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Numeric helpers
 # ---------------------------------------------------------------------------
@@ -306,65 +388,6 @@ def _records(frame: pd.DataFrame, columns: list[str], limit: int = 8) -> list[di
         return []
     cols = [c for c in columns if c in frame.columns]
     return frame.loc[:, cols].head(limit).round(4).to_dict(orient="records")
-
-
-# ---------------------------------------------------------------------------
-# Deterministic insight (no LLM)
-# ---------------------------------------------------------------------------
-
-def deterministic_insight(snapshot: dict[str, Any]) -> str:
-    summary = snapshot["summary"].iloc[0]
-    annual = snapshot["premium_by_year"].sort_values("uw_year")
-    payer_review = snapshot["payer_review"]
-    mobile = snapshot["mobile_by_payer"]
-
-    gp = _number(summary.get("gross_premium_usd"))
-    np = _number(summary.get("net_premium_usd"))
-    tpa = _number(summary.get("tpa_fee_usd"))
-    beneficiaries = int(_number(summary.get("unique_beneficiaries")))
-    registered_users = int(_number(summary.get("registered_users")))
-
-    margin = (gp - np) / gp if gp else float("nan")
-    tpa_ratio = tpa / gp if gp else float("nan")
-
-    bullets = [
-        f"The selected portfolio covers {beneficiaries:,.0f} unique beneficiaries, with "
-        f"{_money(gp)} GP, {_money(np)} NP, and {_money(tpa)} TPA fees.",
-        f"Net-to-gross economics imply a {_pct(margin)} gross-to-net spread; "
-        f"TPA fees are {_pct(tpa_ratio)} of GP.",
-    ]
-
-    if len(annual) >= 2:
-        previous = _number(annual.iloc[-2].get("gross_premium_usd"))
-        latest = _number(annual.iloc[-1].get("gross_premium_usd"))
-        change = (latest / previous - 1) if previous else float("nan")
-        bullets.append(
-            f"GP in {int(annual.iloc[-1]['uw_year'])} is {_pct(change)} versus the prior underwriting year."
-        )
-
-    if not payer_review.empty and gp:
-        top = payer_review.iloc[0]
-        share = _number(top["gross_premium_usd"]) / gp
-        bullets.append(
-            f"{top['payer_name']} is the largest selected payer at {_pct(share)} of GP; "
-            "review concentration and renewal leverage."
-        )
-
-    if beneficiaries:
-        app_rate = registered_users / beneficiaries
-        bullets.append(
-            f"There are {registered_users:,.0f} unique registered users, equal to {_pct(app_rate)} "
-            "of unique beneficiaries."
-        )
-
-    if not mobile.empty:
-        lowest = mobile.sort_values("registered_user_penetration", na_position="last").iloc[0]
-        bullets.append(
-            f"A practical adoption focus is {lowest['payer_name']}, currently at "
-            f"{_pct(_number(lowest['registered_user_penetration']))} registered-user penetration."
-        )
-
-    return "\n".join(f"- {b}" for b in bullets[:5])
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +693,8 @@ def _project_evidence_columns(
                 )
             elif source == "monthly_kpis":
                 selected.extend(("active_population", "active_registered_users"))
+            elif source == "monthly_country_kpis":
+                selected.extend(("active_population", "active_registered_users"))
             elif source == "summary":
                 selected.extend(
                     ("unique_beneficiaries", "registered_users", "registered_beneficiaries")
@@ -715,13 +740,15 @@ def _all_aggregate_metrics_json(snapshot: dict[str, Any]) -> str:
         "policy_type_review",
         "mobile_by_payer",
     )
+    values: dict[str, list[dict[str, Any]]] = {}
+    for table_name in table_names:
+        frame = _aggregate_table(snapshot, table_name)
+        if not frame.empty:
+            values[table_name] = _frame_records(frame)
+
     payload = {
         "metric_catalog": _METRIC_CATALOG,
-        "values": {
-            table_name: _frame_records(_aggregate_table(snapshot, table_name))
-            for table_name in table_names
-            if not _aggregate_table(snapshot, table_name).empty
-        },
+        "values": values,
         "metadata": snapshot.get("metadata", {}),
         "dashboard_query_ms": snapshot.get("query_ms"),
     }
@@ -857,16 +884,349 @@ def build_context(question: str, snapshot: dict[str, Any], filter_summary: str) 
     return build_question_evidence(question, snapshot, filter_summary).context_json
 
 
+# ---------------------------------------------------------------------------
+# Deterministic CXO response engine
+# ---------------------------------------------------------------------------
+
+_METRIC_LABELS = {
+    "gross_premium_usd": "gross premium",
+    "net_premium_usd": "net premium",
+    "tpa_fee_usd": "TPA fee",
+    "app_penetration_rate": "app penetration",
+    "active_population": "active population",
+    "active_registered_users": "active registered users",
+    "unique_beneficiaries": "unique beneficiaries",
+    "net_to_gross_ratio": "net-to-gross ratio",
+    "tpa_to_gross_ratio": "TPA-to-GP ratio",
+}
+_RATE_METRICS = {
+    "app_penetration_rate",
+    "net_to_gross_ratio",
+    "tpa_to_gross_ratio",
+}
+_COUNT_METRICS = {
+    "active_population",
+    "active_registered_users",
+    "unique_beneficiaries",
+}
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if pd.notna(number) else None
+
+
+def _first_number(row: Mapping[str, Any], columns: Sequence[str]) -> float | None:
+    for column in columns:
+        if column not in row:
+            continue
+        value = _finite_number(row.get(column))
+        if value is not None:
+            return value
+    return None
+
+
+def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in {None, 0.0}:
+        return None
+    return numerator / denominator
+
+
+def _metric_value(row: Mapping[str, Any], metric: str) -> float | None:
+    if metric == "app_penetration_rate":
+        direct = _first_number(
+            row, ("app_penetration_rate", "registered_user_penetration")
+        )
+        return direct if direct is not None else _ratio(
+            _first_number(
+                row,
+                (
+                    "registered_users",
+                    "unique_registered_users",
+                    "active_registered_users",
+                ),
+            ),
+            _first_number(
+                row,
+                (
+                    "beneficiaries",
+                    "unique_beneficiaries",
+                    "active_population",
+                    "latest_active_population",
+                ),
+            ),
+        )
+    if metric == "net_to_gross_ratio":
+        direct = _first_number(row, ("net_to_gross_ratio",))
+        return direct if direct is not None else _ratio(
+            _first_number(row, ("net_premium_usd",)),
+            _first_number(row, ("gross_premium_usd",)),
+        )
+    if metric == "tpa_to_gross_ratio":
+        direct = _first_number(row, ("tpa_to_gross_ratio",))
+        return direct if direct is not None else _ratio(
+            _first_number(row, ("tpa_fee_usd",)),
+            _first_number(row, ("gross_premium_usd",)),
+        )
+    columns = {
+        "gross_premium_usd": ("gross_premium_usd",),
+        "net_premium_usd": ("net_premium_usd",),
+        "tpa_fee_usd": ("tpa_fee_usd",),
+        "active_population": ("active_population", "latest_active_population"),
+        "active_registered_users": ("active_registered_users", "registered_users"),
+        "unique_beneficiaries": ("unique_beneficiaries", "beneficiaries"),
+    }
+    return _first_number(row, columns.get(metric, ()))
+
+
+def _primary_metric(evidence: QuestionEvidence) -> str:
+    priority = (
+        "app_penetration_rate",
+        "tpa_to_gross_ratio",
+        "net_to_gross_ratio",
+        "active_population",
+        "active_registered_users",
+        "gross_premium_usd",
+        "net_premium_usd",
+        "tpa_fee_usd",
+        "unique_beneficiaries",
+    )
+    requested = set(evidence.requested_metrics)
+    for metric in priority:
+        if metric in requested:
+            return metric
+    if "adoption" in evidence.intents:
+        return "app_penetration_rate"
+    if "population" in evidence.intents:
+        return "active_population"
+    return "gross_premium_usd"
+
+
+def _format_metric(metric: str, value: float) -> str:
+    if metric in _RATE_METRICS:
+        return _pct(value)
+    if metric in _COUNT_METRICS:
+        return f"{value:,.0f}"
+    return _money(value)
+
+
+def _metric_gap(metric: str, first: float, second: float) -> str:
+    difference = abs(first - second)
+    if metric in _RATE_METRICS:
+        return f"{difference * 100:.1f} percentage points"
+    return _format_metric(metric, difference)
+
+
+def _latest_entity_rows(frame: pd.DataFrame, entity_column: str) -> pd.DataFrame:
+    if frame.empty or "month_end" not in frame or entity_column not in frame:
+        return frame
+    result = frame.copy()
+    result["month_end"] = pd.to_datetime(result["month_end"], errors="coerce")
+    return result.sort_values("month_end").groupby(entity_column, as_index=False).tail(1)
+
+
+def _entity_source(evidence: QuestionEvidence) -> tuple[pd.DataFrame, str] | None:
+    if evidence.matched_entities["payer_countries"]:
+        frame = evidence.tables.get("monthly_country_kpis", pd.DataFrame())
+        return (frame, "payer_country") if not frame.empty else None
+    if evidence.matched_entities["policy_types"]:
+        frame = evidence.tables.get("policy_type_review", pd.DataFrame())
+        return (frame, "policy_type") if not frame.empty else None
+    if evidence.matched_entities["payers"] or "payer" in evidence.intents:
+        frame = evidence.tables.get("payer_review", pd.DataFrame())
+        if not frame.empty:
+            return frame, "payer_name"
+    if "adoption" in evidence.intents:
+        frame = evidence.tables.get("mobile_by_payer", pd.DataFrame())
+        if not frame.empty:
+            return frame, "payer_name"
+    return None
+
+
+def _entity_finding(
+    evidence: QuestionEvidence, metric: str
+) -> tuple[str | None, str | None, str | None]:
+    source = _entity_source(evidence)
+    if source is None:
+        return None, None, None
+
+    frame, entity_column = source
+    frame = _latest_entity_rows(frame, entity_column)
+    candidates: list[tuple[str, float]] = []
+    for _, row in frame.iterrows():
+        if entity_column not in row or pd.isna(row[entity_column]):
+            continue
+        value = _metric_value(row, metric)
+        if value is not None:
+            candidates.append((str(row[entity_column]), value))
+    if not candidates:
+        return None, None, None
+
+    label = _METRIC_LABELS[metric]
+    lower_is_better = metric == "tpa_to_gross_ratio"
+    if len(candidates) == 1:
+        entity, value = candidates[0]
+        statement = f"{entity} is at {_format_metric(metric, value)} for {label}."
+        return statement, statement, entity if lower_is_better else None
+
+    ordered = sorted(candidates, key=lambda item: item[1])
+    low, high = ordered[0], ordered[-1]
+    if lower_is_better:
+        headline = (
+            f"{high[0]} has the highest {label} at {_format_metric(metric, high[1])}, "
+            f"{_metric_gap(metric, high[1], low[1])} above {low[0]}."
+        )
+        evidence_line = (
+            f"The peer range runs from {low[0]} at {_format_metric(metric, low[1])} "
+            f"to {high[0]} at {_format_metric(metric, high[1])}."
+        )
+        return headline, evidence_line, high[0]
+
+    if metric in _RATE_METRICS:
+        headline = (
+            f"{high[0]} leads {low[0]} on {label}: {_format_metric(metric, high[1])} "
+            f"versus {_format_metric(metric, low[1])}, a {_metric_gap(metric, high[1], low[1])} gap."
+        )
+    else:
+        headline = (
+            f"{high[0]} is largest on {label} at {_format_metric(metric, high[1])}; "
+            f"{low[0]} is at {_format_metric(metric, low[1])}."
+        )
+    evidence_line = (
+        f"The observed {label} range is {_format_metric(metric, low[1])} to "
+        f"{_format_metric(metric, high[1])} across the selected entities."
+    )
+    return headline, evidence_line, low[0] if metric in _RATE_METRICS else None
+
+
+def _time_label(value: Any, source: str) -> str:
+    if source == "monthly_kpis":
+        timestamp = pd.to_datetime(value, errors="coerce")
+        return timestamp.strftime("%b %Y") if pd.notna(timestamp) else str(value)
+    return str(int(value)) if _finite_number(value) is not None else str(value)
+
+
+def _trend_finding(evidence: QuestionEvidence, metric: str) -> str | None:
+    candidates = (
+        ("monthly_kpis", "month_end", "monthly"),
+        ("premium_by_year", "uw_year", "underwriting-year"),
+    )
+    for source, period_column, cadence in candidates:
+        frame = evidence.tables.get(source, pd.DataFrame())
+        if frame.empty or period_column not in frame:
+            continue
+        values: list[tuple[Any, float]] = []
+        for _, row in frame.sort_values(period_column).iterrows():
+            value = _metric_value(row, metric)
+            if value is not None:
+                values.append((row[period_column], value))
+        if len(values) < 2:
+            continue
+        previous, latest = values[-2], values[-1]
+        if metric in _RATE_METRICS:
+            change = f"{(latest[1] - previous[1]) * 100:+.1f} percentage points"
+        elif previous[1] == 0:
+            change = "from a zero base"
+        else:
+            change = _pct(latest[1] / previous[1] - 1)
+        return (
+            f"{cadence.capitalize()} { _METRIC_LABELS[metric] } is "
+            f"{_format_metric(metric, latest[1])} in {_time_label(latest[0], source)}, "
+            f"{change} versus {_time_label(previous[0], source)}."
+        )
+    return None
+
+
+def _scope_summary(evidence: QuestionEvidence) -> str | None:
+    frame = evidence.tables.get("summary", pd.DataFrame())
+    if frame.empty:
+        return None
+    row = frame.iloc[0]
+    beneficiaries = _metric_value(row, "unique_beneficiaries")
+    gross_premium = _metric_value(row, "gross_premium_usd")
+    net_premium = _metric_value(row, "net_premium_usd")
+    if beneficiaries is None or gross_premium is None:
+        return None
+    text = (
+        f"The applied scope covers {beneficiaries:,.0f} unique beneficiaries and "
+        f"{_money(gross_premium)} GP"
+    )
+    if net_premium is not None:
+        text += f" / {_money(net_premium)} NP"
+    return text + "."
+
+
+def _recommended_actions(
+    evidence: QuestionEvidence, priority_entity: str | None
+) -> list[str]:
+    target = priority_entity or "the lowest-performing segment"
+    if "adoption" in evidence.intents:
+        return [
+            f"Set a 90-day registration activation plan for {target}, focused on enrolment and renewal touchpoints.",
+            "Track active registered users and app penetration monthly, with a named owner for the conversion gap.",
+        ]
+    if "economics" in evidence.intents:
+        return [
+            f"Review pricing, benefit design, and TPA terms for {target} before the next renewal decision.",
+            "Use the premium and ratio trend as a monthly value-for-money control, not a one-off year-end review.",
+        ]
+    if "population" in evidence.intents:
+        return [
+            "Align service capacity and member communications to the latest active-population trend.",
+            "Review the country and payer mix behind material movement before changing the operating plan.",
+        ]
+    return [
+        "Prioritise the largest evidence-backed variance in the next portfolio review.",
+        "Assign a payer or policy owner, action date, and monthly outcome metric before the next QBR.",
+    ]
+
+
+def generate_executive_answer(evidence: QuestionEvidence) -> str:
+    """Generate an instant, evidence-bound executive response without an external model."""
+
+    metric = _primary_metric(evidence)
+    headline, entity_evidence, priority_entity = _entity_finding(evidence, metric)
+    trend = _trend_finding(evidence, metric)
+    summary = _scope_summary(evidence)
+    executive_answer = headline or trend or summary
+    if executive_answer is None:
+        executive_answer = (
+            "The selected scope does not contain enough aggregate evidence to answer this question reliably."
+        )
+
+    evidence_lines = [line for line in (entity_evidence, trend, summary) if line]
+    if evidence.limitations:
+        evidence_lines.append(f"Limitation: {evidence.limitations[0]}")
+    if not evidence_lines:
+        evidence_lines.append("No relevant aggregate evidence was returned for the selected scope.")
+
+    actions = _recommended_actions(evidence, priority_entity)
+    evidence_markdown = "\n".join(f"- {line}" for line in evidence_lines[:4])
+    action_markdown = "\n".join(
+        f"{index}. {action}" for index, action in enumerate(actions[:2], start=1)
+    )
+    return (
+        f"**Executive answer**\n\n{executive_answer}\n\n"
+        f"**Evidence**\n{evidence_markdown}\n\n"
+        f"**Recommended actions**\n{action_markdown}"
+    )
+
+
 def record_evaluation(
     *,
     evaluation_dir: str | Path,
     evidence: QuestionEvidence,
     answer: str | None,
-    model: str,
+    response_engine: str,
     response_status: str,
+    configured_model: str | None,
+    model_check_status: str | None,
     filter_spec_json: str,
     planning_ms: float | None,
-    model_ms: float | None,
+    response_ms: float | None,
     dashboard_query_ms: float | None,
     error_message: str | None = None,
 ) -> Path:
@@ -880,7 +1240,7 @@ def record_evaluation(
         f"gen_bi_{timestamp:%Y%m%dT%H%M%S%fZ}_{interaction_id}.parquet"
     )
     record = {
-        "schema_version": 1,
+        "schema_version": 3,
         "interaction_id": interaction_id,
         "timestamp_utc": pd.Timestamp(timestamp),
         "question": evidence.question,
@@ -896,83 +1256,14 @@ def record_evaluation(
         "evidence_context_json": evidence.context_json,
         "all_aggregate_metrics_json": evidence.all_metrics_json,
         "answer": answer or "",
-        "model": model,
+        "response_engine": response_engine,
         "response_status": response_status,
+        "configured_model": configured_model or "",
+        "model_check_status": model_check_status or "not_checked",
         "error_message": error_message or "",
         "planning_ms": planning_ms,
-        "model_ms": model_ms,
+        "response_ms": response_ms,
         "dashboard_query_ms": dashboard_query_ms,
     }
     pd.DataFrame([record]).to_parquet(output_path, index=False, compression="zstd")
     return output_path
-
-
-# ---------------------------------------------------------------------------
-# Model discovery
-# ---------------------------------------------------------------------------
-
-def available_models(host: str, timeout_seconds: float = 1.0) -> list[str]:
-    try:
-        r = requests.get(f"{host.rstrip('/')}/api/tags", timeout=timeout_seconds)
-        r.raise_for_status()
-        return [m["name"] for m in r.json().get("models", [])]
-    except Exception:
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Ollama call
-# ---------------------------------------------------------------------------
-
-def ask_ollama(
-    *,
-    host: str,
-    model: str,
-    question: str,
-    context: str,
-    timeout_seconds: int = 90,
-) -> str:
-
-    system = (
-        "You are a senior MBB engagement manager preparing a concise CXO briefing for an "
-        "insurance portfolio. Answer only the business question using the supplied "
-        "question-specific aggregate evidence. Never invent data, never expose or request "
-        "individual member data, and do not write SQL. Use exactly this Markdown structure: "
-        "**Executive answer** (one direct, decision-oriented paragraph); **Evidence** "
-        "(2-4 quantified bullets that answer the question); **Recommended actions** "
-        "(2-3 numbered, practical actions). Cite values precisely, distinguish facts from "
-        "recommendations, and state any listed limitation plainly. Keep the response below "
-        "220 words."
-    )
-
-    payload = {
-        "model": model,
-        "stream": False,
-        "keep_alive": "30m",
-        "messages": [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": (
-                    f"Business question: {question.strip()}\n\n"
-                    f"Question-specific aggregate evidence (JSON): {context}"
-                ),
-            },
-        ],
-        "options": {"temperature": 0.1, "num_predict": 220, "num_ctx": 4096},
-    }
-
-    r = requests.post(
-        f"{host.rstrip('/')}/api/chat",
-        json=payload,
-        timeout=timeout_seconds,
-    )
-    r.raise_for_status()
-
-    content = r.json().get("message", {}).get("content", "")
-    content = content.strip()
-
-    if not content:
-        raise RuntimeError("Ollama returned an empty response.")
-
-    return content
