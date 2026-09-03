@@ -18,9 +18,18 @@ import requests
 
 DETERMINISTIC_ENGINE = "deterministic-cxo-engine-v1"
 OLLAMA_ENGINE = "ollama"
+OLLAMA_REPRODUCIBILITY_PROFILE = "greedy-seed-42-v1"
 _DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 _DEFAULT_OLLAMA_MODEL = "llama3.2:1b"
 _MAX_MODEL_CONTEXT_CHARS = 18_000
+_OLLAMA_REPRODUCIBILITY_OPTIONS = {
+    "seed": 42,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "min_p": 0.0,
+    "mirostat": 0,
+}
 
 
 @dataclass
@@ -127,7 +136,7 @@ def _ollama_generate(
         "stream": False,
         "keep_alive": keep_alive,
         "options": {
-            "temperature": 0.1,
+            **_OLLAMA_REPRODUCIBILITY_OPTIONS,
             "num_predict": max_tokens,
             "num_ctx": 4096,
         },
@@ -333,6 +342,19 @@ _METRIC_CATALOG: dict[str, dict[str, str]] = {
         "net_to_gross_ratio": "Net premium divided by gross premium by payer.",
         "tpa_to_gross_ratio": "TPA fee divided by gross premium by payer.",
     },
+    "master_contract_network_premium": {
+        "gross_premium_usd": "Gross premium in USD by master contract and network type.",
+    },
+    "age_bucket_review": {
+        "beneficiaries": "Distinct beneficiaries by age bucket.",
+        "registered_users": "Distinct registered users by age bucket.",
+        "gross_premium_usd": "Gross premium in USD by age bucket.",
+        "net_premium_usd": "Net premium in USD by age bucket.",
+        "tpa_fee_usd": "TPA fee in USD by age bucket.",
+        "app_penetration_rate": "Registered users divided by beneficiaries by age bucket.",
+        "net_to_gross_ratio": "Net premium divided by gross premium by age bucket.",
+        "tpa_to_gross_ratio": "TPA fee divided by gross premium by age bucket.",
+    },
     "policy_type_review": {
         "beneficiaries": "Distinct beneficiaries by policy type.",
         "gross_premium_usd": "Gross premium in USD by policy type.",
@@ -353,6 +375,8 @@ _TABLE_LABELS = {
     "monthly_country_kpis": "Country operating metrics",
     "premium_by_year": "Premium by underwriting year",
     "payer_review": "Payer comparison",
+    "master_contract_network_premium": "Master-contract network mix",
+    "age_bucket_review": "Age-bucket demographic comparison",
     "policy_type_review": "Policy type comparison",
     "mobile_by_payer": "Mobile adoption by payer",
 }
@@ -478,7 +502,15 @@ def _infer_intents(
             "digital",
         ),
         "population": ("population", "beneficiary", "member", "active"),
-        "policy": ("policy", "product", "network", "contract", "underwriting"),
+        "policy": ("policy", "product", "network", "underwriting"),
+        "master_contract": ("master contract", "contract"),
+        "demographic": (
+            "demographic",
+            "age bucket",
+            "age band",
+            "age group",
+            "age profile",
+        ),
         "payer": ("payer", "insurer", "carrier"),
         "country": ("country", "countries", "market", "markets"),
         "trend": (
@@ -508,6 +540,10 @@ def _infer_intents(
         selected.append("country")
     if matched_entities["policy_types"] and "policy" not in selected:
         selected.append("policy")
+    if matched_entities["master_contracts"] and "master_contract" not in selected:
+        selected.append("master_contract")
+    if matched_entities["age_buckets"] and "demographic" not in selected:
+        selected.append("demographic")
     return tuple(selected or ["portfolio"])
 
 
@@ -537,18 +573,25 @@ def _source_tables(
     intents: Sequence[str], matched_entities: Mapping[str, tuple[str, ...]]
 ) -> tuple[str, ...]:
     sources = ["summary"]
-    if "economics" in intents or "trend" in intents:
+    if ("economics" in intents or "trend" in intents) and "master_contract" not in intents:
         sources.append("premium_by_year")
     if "payer" in intents or matched_entities["payers"]:
         sources.append("payer_review")
-    if "adoption" in intents:
+    if "adoption" in intents and "demographic" not in intents:
         sources.extend(["mobile_by_payer", "monthly_kpis"])
-    if "population" in intents:
+    if "population" in intents and "demographic" not in intents:
         sources.append("monthly_kpis")
     if "country" in intents or matched_entities["payer_countries"]:
         sources.append("monthly_country_kpis")
-    if "policy" in intents or matched_entities["policy_types"]:
+    if (
+        ("policy" in intents or matched_entities["policy_types"])
+        and "master_contract" not in intents
+    ):
         sources.append("policy_type_review")
+    if "master_contract" in intents or matched_entities["master_contracts"]:
+        sources.append("master_contract_network_premium")
+    if "demographic" in intents or matched_entities["age_buckets"]:
+        sources.append("age_bucket_review")
     if len(sources) == 1:
         sources.extend(["premium_by_year", "payer_review"])
     return tuple(_unique_text(sources))
@@ -580,6 +623,19 @@ def _filter_rows(frame: pd.DataFrame, column: str, values: Sequence[str]) -> pd.
     if frame.empty or not values or column not in frame:
         return frame.copy()
     return frame.loc[frame[column].isin(values)].copy()
+
+
+def _master_contract_totals(frame: pd.DataFrame) -> pd.DataFrame:
+    """Collapse network rows into one gross-premium total per master contract."""
+
+    required_columns = {"master_contract", "gross_premium_usd"}
+    if frame.empty or not required_columns.issubset(frame.columns):
+        return pd.DataFrame(columns=["master_contract", "gross_premium_usd"])
+    return (
+        frame.groupby("master_contract", as_index=False, dropna=False)["gross_premium_usd"]
+        .sum()
+        .sort_values("gross_premium_usd", ascending=False, na_position="last")
+    )
 
 
 def _rank_entity_rows(frame: pd.DataFrame, question: str) -> pd.DataFrame:
@@ -647,6 +703,25 @@ def _evidence_table(
         if not matched_entities["payers"]:
             result = _rank_entity_rows(result, question).head(12)
         return result
+    if source == "master_contract_network_premium":
+        result = _filter_rows(frame, "master_contract", matched_entities["master_contracts"])
+        if matched_entities["master_contracts"]:
+            return result.sort_values(
+                ["master_contract", "gross_premium_usd"],
+                ascending=[True, False],
+                na_position="last",
+            )
+        top_contracts = _master_contract_totals(result).head(12)["master_contract"]
+        return result.loc[result["master_contract"].isin(top_contracts)].sort_values(
+            ["master_contract", "gross_premium_usd"],
+            ascending=[True, False],
+            na_position="last",
+        )
+    if source == "age_bucket_review":
+        result = _filter_rows(frame, "age_bucket", matched_entities["age_buckets"])
+        if not matched_entities["age_buckets"]:
+            result = _rank_entity_rows(result, question).head(12)
+        return result
     if source == "policy_type_review":
         result = _filter_rows(frame, "policy_type", matched_entities["policy_types"])
         return result if matched_entities["policy_types"] else result.head(12)
@@ -664,6 +739,8 @@ def _project_evidence_columns(
         "monthly_country_kpis": ("month_end", "payer_country"),
         "premium_by_year": ("uw_year", "beneficiaries"),
         "payer_review": ("payer_name",),
+        "master_contract_network_premium": ("master_contract", "network_type"),
+        "age_bucket_review": ("age_bucket",),
         "policy_type_review": ("policy_type", "beneficiaries"),
         "mobile_by_payer": ("payer_name",),
     }
@@ -678,7 +755,7 @@ def _project_evidence_columns(
     for metric in requested_metrics:
         selected.extend(common_metrics.get(metric, ()))
         if metric == "app_penetration_rate":
-            if source == "payer_review":
+            if source in {"payer_review", "age_bucket_review"}:
                 selected.extend(
                     ("beneficiaries", "registered_users", "app_penetration_rate")
                 )
@@ -737,6 +814,7 @@ def _all_aggregate_metrics_json(snapshot: dict[str, Any]) -> str:
         "monthly_country_kpis",
         "premium_by_year",
         "payer_review",
+        "age_bucket_review",
         "policy_type_review",
         "mobile_by_payer",
     )
@@ -758,6 +836,14 @@ def _all_aggregate_metrics_json(snapshot: dict[str, Any]) -> str:
 def _focus_label(
     intents: Sequence[str], matched_entities: Mapping[str, tuple[str, ...]]
 ) -> str:
+    if matched_entities["master_contracts"]:
+        return "Named master-contract review"
+    if "master_contract" in intents:
+        return "Master-contract review"
+    if matched_entities["age_buckets"]:
+        return "Named age-bucket demographic review"
+    if "demographic" in intents:
+        return "Age-bucket demographic review"
     if matched_entities["payers"] and "adoption" in intents:
         return "Payer digital-adoption comparison"
     if matched_entities["payers"]:
@@ -810,10 +896,26 @@ def build_question_evidence(
         "policy_type_review",
         "policy_type",
     )
+    master_contract_values = _entity_values(
+        snapshot,
+        entity_catalog,
+        "contracts",
+        "master_contract_network_premium",
+        "master_contract",
+    )
+    age_bucket_values = _entity_values(
+        snapshot,
+        entity_catalog,
+        "age_buckets",
+        "age_bucket_review",
+        "age_bucket",
+    )
     matched_entities = {
         "payers": _match_entities(cleaned_question, payer_values),
         "payer_countries": _match_entities(cleaned_question, country_values),
         "policy_types": _match_entities(cleaned_question, policy_type_values),
+        "master_contracts": _match_entities(cleaned_question, master_contract_values),
+        "age_buckets": _match_entities(cleaned_question, age_bucket_values),
     }
     intents = _infer_intents(cleaned_question, matched_entities)
     requested_metrics = _requested_metrics(cleaned_question, intents)
@@ -841,6 +943,18 @@ def build_question_evidence(
         and tables.get("policy_type_review", pd.DataFrame()).empty
     ):
         limitations.append("No policy-type aggregate row was available for the policy type named in the question.")
+    if (
+        matched_entities["master_contracts"]
+        and tables.get("master_contract_network_premium", pd.DataFrame()).empty
+    ):
+        limitations.append(
+            "No master-contract network aggregate row was available for the contract named in the question."
+        )
+    if (
+        matched_entities["age_buckets"]
+        and tables.get("age_bucket_review", pd.DataFrame()).empty
+    ):
+        limitations.append("No age-bucket aggregate row was available for the demographic segment named in the question.")
     if "country" in intents and "economics" in intents:
         limitations.append(
             "Country-level activity metrics are available; premium economics remain aggregated at payer and policy-type level."
@@ -1029,6 +1143,18 @@ def _latest_entity_rows(frame: pd.DataFrame, entity_column: str) -> pd.DataFrame
 
 
 def _entity_source(evidence: QuestionEvidence) -> tuple[pd.DataFrame, str] | None:
+    if (
+        evidence.matched_entities["master_contracts"]
+        or "master_contract" in evidence.intents
+    ):
+        frame = evidence.tables.get("master_contract_network_premium", pd.DataFrame())
+        totals = _master_contract_totals(frame)
+        if not totals.empty:
+            return totals, "master_contract"
+    if evidence.matched_entities["age_buckets"] or "demographic" in evidence.intents:
+        frame = evidence.tables.get("age_bucket_review", pd.DataFrame())
+        if not frame.empty:
+            return frame, "age_bucket"
     if evidence.matched_entities["payer_countries"]:
         frame = evidence.tables.get("monthly_country_kpis", pd.DataFrame())
         return (frame, "payer_country") if not frame.empty else None
@@ -1223,6 +1349,7 @@ def record_evaluation(
     response_engine: str,
     response_status: str,
     configured_model: str | None,
+    generation_profile: str | None,
     model_check_status: str | None,
     filter_spec_json: str,
     planning_ms: float | None,
@@ -1240,7 +1367,7 @@ def record_evaluation(
         f"gen_bi_{timestamp:%Y%m%dT%H%M%S%fZ}_{interaction_id}.parquet"
     )
     record = {
-        "schema_version": 3,
+        "schema_version": 4,
         "interaction_id": interaction_id,
         "timestamp_utc": pd.Timestamp(timestamp),
         "question": evidence.question,
@@ -1259,6 +1386,7 @@ def record_evaluation(
         "response_engine": response_engine,
         "response_status": response_status,
         "configured_model": configured_model or "",
+        "generation_profile": generation_profile or "",
         "model_check_status": model_check_status or "not_checked",
         "error_message": error_message or "",
         "planning_ms": planning_ms,

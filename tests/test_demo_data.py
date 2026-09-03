@@ -66,3 +66,6 @@ def test_demo_data_covers_every_dashboard_dimension(tmp_path: Path) -> None:
     assert scoped["summary"].iloc[0]["policy_records"] > 0
     assert not scoped["active_population"].empty
     assert not scoped["monthly_country_kpis"].empty
+    assert not scoped["monthly_network_type_kpis"].empty
+    assert not scoped["monthly_network_group_kpis"].empty
+    assert not scoped["monthly_policy_type_kpis"].empty

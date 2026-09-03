@@ -3,105 +3,124 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import requests
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import policy_dashboard.gen_bi as gen_bi
+from policy_dashboard import ollama_runtime
 
 
-class _FakeResponse:
-    def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
-        self._payload = payload
-        self.status_code = status_code
+class _RunningProcess:
+    pid = 4321
 
-    def json(self) -> dict[str, object]:
-        return self._payload
+    def poll(self) -> None:
+        return None
 
 
-def test_ollama_config_reads_dotenv_and_allows_process_overrides(
-    tmp_path: Path, monkeypatch
-) -> None:
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "OLLAMA_HOST=http://127.0.0.1:11435\nOLLAMA_MODEL=test-model:1b\n",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("OLLAMA_HOST", raising=False)
-    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
-
-    config = gen_bi.get_ollama_config(env_file)
-    assert config.host == "http://127.0.0.1:11435"
-    assert config.model == "test-model:1b"
-
-    monkeypatch.setenv("OLLAMA_MODEL", "process-model:3b")
-    overridden = gen_bi.get_ollama_config(env_file)
-    assert overridden.host == "http://127.0.0.1:11435"
-    assert overridden.model == "process-model:3b"
-
-
-def test_model_response_probe_uses_a_real_minimal_generation(monkeypatch) -> None:
-    calls: list[dict[str, object]] = []
-
-    def fake_post(url: str, **kwargs):
-        calls.append({"url": url, **kwargs})
-        return _FakeResponse({"response": "READY"})
-
-    monkeypatch.setattr(gen_bi.requests, "post", fake_post)
-
-    status = gen_bi.check_ollama_model_response(
-        "http://127.0.0.1:11434", "test-model:1b"
+def test_get_ollama_serve_status_only_checks_availability(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_is_ollama_ready",
+        lambda host, timeout_seconds: True,
     )
 
-    assert status.is_responding
-    assert status.sample_response == "READY"
-    assert calls[0]["url"] == "http://127.0.0.1:11434/api/generate"
-    payload = calls[0]["json"]
-    assert isinstance(payload, dict)
-    assert payload["model"] == "test-model:1b"
-    assert payload["prompt"] == "Reply with READY only."
-    assert payload["stream"] is False
-    assert payload["options"]["num_predict"] == 4
+    def no_start(*args, **kwargs):
+        raise AssertionError("A passive status check must not start Ollama.")
+
+    monkeypatch.setattr(ollama_runtime.subprocess, "Popen", no_start)
+
+    status = ollama_runtime.get_ollama_serve_status("http://127.0.0.1:11434")
+
+    assert status.is_ready
+    assert not status.started
+    assert status.process_id is None
+    assert "available" in status.message.lower()
 
 
-def test_model_response_probe_reports_connection_failure(monkeypatch) -> None:
-    def fake_post(*_args, **_kwargs):
-        raise requests.ConnectionError("connection refused")
-
-    monkeypatch.setattr(gen_bi.requests, "post", fake_post)
-
-    status = gen_bi.check_ollama_model_response(
-        "http://127.0.0.1:11434", "test-model:1b"
+def test_ensure_ollama_leaves_a_ready_endpoint_untouched(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_is_ollama_ready",
+        lambda host, timeout_seconds: True,
     )
 
-    assert not status.is_responding
-    assert "No response from configured Ollama endpoint" in status.message
+    def no_start(*args, **kwargs):
+        raise AssertionError("A healthy endpoint must not be restarted.")
+
+    monkeypatch.setattr(ollama_runtime.subprocess, "Popen", no_start)
+
+    status = ollama_runtime.ensure_ollama("http://127.0.0.1:11434")
+
+    assert status.is_ready
+    assert not status.started
+    assert status.process_id is None
 
 
-def test_narration_is_aggregate_bound_and_has_no_server_launcher(monkeypatch) -> None:
-    calls: list[dict[str, object]] = []
-
-    def fake_post(url: str, **kwargs):
-        calls.append({"url": url, **kwargs})
-        return _FakeResponse({"response": "**Executive answer**\n\nReady."})
-
-    monkeypatch.setattr(gen_bi.requests, "post", fake_post)
-
-    answer = gen_bi.ask_ollama(
-        host="http://127.0.0.1:11434",
-        model="test-model:1b",
-        question="Which payer needs attention?",
-        context_json='{"evidence":{"payer_review":[{"payer_name":"Allianz"}]}}',
+def test_ensure_ollama_never_starts_a_remote_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_is_ollama_ready",
+        lambda host, timeout_seconds: False,
     )
 
-    assert answer.startswith("**Executive answer**")
-    payload = calls[0]["json"]
-    assert isinstance(payload, dict)
-    assert "Which payer needs attention?" in payload["prompt"]
-    assert "payer_review" in payload["prompt"]
-    assert payload["options"]["num_predict"] == 220
-    assert not hasattr(gen_bi, "ensure_ollama_server")
+    def no_start(*args, **kwargs):
+        raise AssertionError("Remote endpoints must not be managed locally.")
+
+    monkeypatch.setattr(ollama_runtime.subprocess, "Popen", no_start)
+
+    status = ollama_runtime.ensure_ollama("https://ollama.example.test:11434")
+
+    assert not status.is_ready
+    assert not status.started
+    assert "localhost" in status.message
+
+
+def test_ensure_ollama_does_not_start_an_https_loopback_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_is_ollama_ready",
+        lambda host, timeout_seconds: False,
+    )
+
+    def no_start(*args, **kwargs):
+        raise AssertionError("An HTTPS loopback endpoint cannot be served by Ollama.")
+
+    monkeypatch.setattr(ollama_runtime.subprocess, "Popen", no_start)
+
+    status = ollama_runtime.ensure_ollama("https://127.0.0.1:11434")
+
+    assert not status.is_ready
+    assert not status.started
+    assert "HTTP OLLAMA_HOST" in status.message
+
+
+def test_ensure_ollama_starts_a_local_runtime_without_a_shell(monkeypatch) -> None:
+    readiness = iter((False, True))
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_is_ollama_ready",
+        lambda host, timeout_seconds: next(readiness),
+    )
+    monkeypatch.setattr(
+        ollama_runtime.shutil,
+        "which",
+        lambda executable: "C:\\Program Files\\Ollama\\ollama.exe",
+    )
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def start(command, **kwargs):
+        calls.append((command, kwargs))
+        return _RunningProcess()
+
+    monkeypatch.setattr(ollama_runtime.subprocess, "Popen", start)
+
+    status = ollama_runtime.ensure_ollama("http://127.0.0.1:11434")
+
+    assert status.is_ready
+    assert status.started
+    assert status.process_id == 4321
+    assert calls[0][0] == ["C:\\Program Files\\Ollama\\ollama.exe", "serve"]
+    assert "shell" not in calls[0][1]
+    assert calls[0][1]["env"]["OLLAMA_HOST"] == "127.0.0.1:11434"

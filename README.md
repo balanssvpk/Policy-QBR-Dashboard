@@ -57,9 +57,10 @@ python -m streamlit run app.py
 ## Ollama setup
 
 Install Ollama using your normal operating-system setup and pull the model
-configured in `.env`. The dashboard never starts, stops, or otherwise manages
-the Ollama service; the configured endpoint must already be available. It does
-not pull models automatically.
+configured in `.env`. The Gen BI page shows the configured `ollama serve`
+availability, and starts it on demand only for a submitted Gen BI question when
+the endpoint is local loopback. It never stops a service, kills a process,
+manages remote endpoints, or pulls models automatically.
 
 ```dotenv
 OLLAMA_HOST=http://127.0.0.1:11434
@@ -73,10 +74,10 @@ ollama pull llama3.2:1b
 python -m streamlit run app.py
 ```
 
-Use **Check model response** in the Gen BI page to send the configured model a
-small `READY` prompt. The same probe runs only after a Gen BI narration fails,
-so it distinguishes an unavailable model from a prompt-specific problem without
-adding model work to normal dashboard reruns.
+The Gen BI page displays a lightweight `Ollama serve` status message. When you
+generate an insight, the pipeline starts a configured local endpoint if needed,
+then sends the narrative request. A minimal internal diagnostic runs only after
+a narration failure, so normal dashboard reruns never invoke the model.
 
 For a Lenovo P5 with 128 GB RAM and no GPU, use a small quantized 1–3B model,
 keep it warm, limit the response to ~180 tokens, and retain the cache. The

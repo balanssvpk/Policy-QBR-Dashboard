@@ -1,6 +1,6 @@
 [theme]
 base = "light"
-primaryColor = "#003781"
+primaryColor = "#415e84"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#EEF7FB"
 textColor = "#002B5C"
@@ -23,7 +23,7 @@ backgroundColor = "#F4FAFD"
 secondaryBackgroundColor = "#E4F3FA"
 codeBackgroundColor = "#E4F3FA"
 textColor = "#002B5C"
-primaryColor = "#003781"
+primaryColor = "#01459f"
 borderColor = "#C7DDEA"
 
 [server]

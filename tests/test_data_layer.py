@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import duckdb
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,19 @@ def test_mart_build_and_dashboard_queries(tmp_path: Path) -> None:
     assert monthly_kpis["gross_premium_usd"].sum() == pytest.approx(
         summary["gross_premium_usd"]
     )
+    premium_by_year = snapshot["premium_by_year"]
+    assert set(premium_by_year.columns) == {
+        "uw_year",
+        "beneficiaries",
+        "registered_users",
+        "app_penetration",
+        "gross_premium_usd",
+        "net_premium_usd",
+        "tpa_fee_usd",
+    }
+    assert premium_by_year["gross_premium_usd"].sum() == pytest.approx(
+        summary["gross_premium_usd"]
+    )
     monthly_country_kpis = snapshot["monthly_country_kpis"]
     assert len(monthly_country_kpis) == 36
     assert set(monthly_country_kpis.columns) == {
@@ -57,11 +71,86 @@ def test_mart_build_and_dashboard_queries(tmp_path: Path) -> None:
         "payer_country",
         "active_population",
         "active_registered_users",
+        "gross_premium_usd",
+        "net_premium_usd",
+        "tpa_fee_usd",
     }
     assert set(monthly_country_kpis["payer_country"]) == {"Egypt"}
-    assert monthly_country_kpis["active_population"].tolist() == monthly_kpis[
-        "active_population"
-    ].tolist()
+    for metric in (
+        "active_population",
+        "active_registered_users",
+        "gross_premium_usd",
+        "net_premium_usd",
+        "tpa_fee_usd",
+    ):
+        assert monthly_country_kpis[metric].tolist() == monthly_kpis[metric].tolist()
+    payer_network_premium = snapshot["payer_network_premium"]
+    assert set(payer_network_premium.columns) == {
+        "payer_name",
+        "network_type",
+        "gross_premium_usd",
+    }
+    assert payer_network_premium.to_dict("records") == [
+        {
+            "payer_name": "Allianz",
+            "network_type": "GN",
+            "gross_premium_usd": pytest.approx(1124.9),
+        }
+    ]
+    master_contract_network_premium = snapshot["master_contract_network_premium"]
+    assert set(master_contract_network_premium.columns) == {
+        "master_contract",
+        "network_type",
+        "gross_premium_usd",
+    }
+    assert master_contract_network_premium.to_dict("records") == [
+        {
+            "master_contract": "CIB Families",
+            "network_type": "GN",
+            "gross_premium_usd": pytest.approx(1124.9),
+        }
+    ]
+    age_bucket_review = snapshot["age_bucket_review"]
+    assert set(age_bucket_review.columns) == {
+        "age_bucket",
+        "beneficiaries",
+        "registered_users",
+        "registered_beneficiaries",
+        "gross_premium_usd",
+        "net_premium_usd",
+        "tpa_fee_usd",
+        "app_penetration_rate",
+        "net_to_gross_ratio",
+        "tpa_to_gross_ratio",
+    }
+    assert age_bucket_review.loc[0, "age_bucket"] == "30-39"
+    assert age_bucket_review.loc[0, "beneficiaries"] == 2
+    assert age_bucket_review.loc[0, "app_penetration_rate"] == pytest.approx(1 / 2)
+    for snapshot_key, dimension_column, expected_value in (
+        ("monthly_network_type_kpis", "network_type", "GN"),
+        ("monthly_network_group_kpis", "network_group", "NonPCP"),
+        ("monthly_policy_type_kpis", "policy_type", "Group"),
+    ):
+        dimension_monthly = snapshot[snapshot_key]
+        assert len(dimension_monthly) == 36
+        assert set(dimension_monthly.columns) == {
+            "month_end",
+            dimension_column,
+            "active_population",
+            "active_registered_users",
+            "gross_premium_usd",
+            "net_premium_usd",
+            "tpa_fee_usd",
+        }
+        assert set(dimension_monthly[dimension_column]) == {expected_value}
+        for metric in (
+            "active_population",
+            "active_registered_users",
+            "gross_premium_usd",
+            "net_premium_usd",
+            "tpa_fee_usd",
+        ):
+            assert dimension_monthly[metric].tolist() == monthly_kpis[metric].tolist()
 
 
 def test_loader_sniffs_tab_delimited_csv_content(tmp_path: Path) -> None:
@@ -72,3 +161,39 @@ def test_loader_sniffs_tab_delimited_csv_content(tmp_path: Path) -> None:
     result = build_mart(source, mart)
     assert result.policy_records == 3
     assert result.active_member_month_rows == 36
+
+
+def test_dashboard_query_falls_back_from_legacy_dimension_aggregate(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "policies.csv"
+    mart = tmp_path / "policy_mart.duckdb"
+    source.write_text(SAMPLE, encoding="utf-8")
+    build_mart(source, mart)
+
+    with duckdb.connect(str(mart)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE monthly_dimension_population_legacy AS
+            SELECT month_end, dimension, dimension_value, active_population
+            FROM monthly_dimension_population_default
+            """
+        )
+        connection.execute("DROP TABLE monthly_dimension_population_default")
+        connection.execute(
+            """
+            ALTER TABLE monthly_dimension_population_legacy
+            RENAME TO monthly_dimension_population_default
+            """
+        )
+
+    snapshot = query_dashboard(mart, FilterSpec(year_start=2024, year_end=2026))
+    assert {
+        "month_end",
+        "network_type",
+        "active_population",
+        "active_registered_users",
+        "gross_premium_usd",
+        "net_premium_usd",
+        "tpa_fee_usd",
+    } == set(snapshot["monthly_network_type_kpis"].columns)

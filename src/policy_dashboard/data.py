@@ -328,6 +328,7 @@ def build_mart(source_path: str | Path, mart_path: str | Path) -> BuildResult:
         connection.execute("DROP TABLE IF EXISTS raw_policy_source")
         connection.execute("DROP TABLE IF EXISTS monthly_kpis_default")
         connection.execute("DROP TABLE IF EXISTS monthly_country_kpis_default")
+        connection.execute("DROP TABLE IF EXISTS monthly_dimension_population_default")
         connection.execute("DROP TABLE IF EXISTS active_population_default")
         connection.execute("DROP TABLE IF EXISTS active_member_months")
         connection.execute("DROP TABLE IF EXISTS filter_options")
@@ -477,10 +478,63 @@ def build_mart(source_path: str | Path, mart_path: str | Path) -> BuildResult:
                      AND registered_user_key IS NOT NULL
                      AND (registration_date IS NULL OR registration_date <= month_end)
                     THEN registered_user_key
-                END) AS active_registered_users
+                END) AS active_registered_users,
+                COALESCE(SUM(gross_premium_usd), 0) AS gross_premium_usd,
+                COALESCE(SUM(net_premium_usd), 0) AS net_premium_usd,
+                COALESCE(SUM(tpa_fee_usd), 0) AS tpa_fee_usd
             FROM active_member_months
             GROUP BY month_end, COALESCE(payer_country, 'Unassigned')
             ORDER BY month_end, payer_country
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE monthly_dimension_population_default AS
+            WITH grouped AS (
+                SELECT
+                    month_end,
+                    network_type,
+                    network_group,
+                    policy_type,
+                    GROUPING(network_type) AS network_type_grouped,
+                    GROUPING(network_group) AS network_group_grouped,
+                    GROUPING(policy_type) AS policy_type_grouped,
+                    COUNT(DISTINCT beneficiary_key) AS active_population,
+                    COUNT(DISTINCT CASE
+                        WHEN beneficiary_key IS NOT NULL
+                         AND registered_user_key IS NOT NULL
+                         AND (registration_date IS NULL OR registration_date <= month_end)
+                        THEN registered_user_key
+                    END) AS active_registered_users,
+                    COALESCE(SUM(gross_premium_usd), 0) AS gross_premium_usd,
+                    COALESCE(SUM(net_premium_usd), 0) AS net_premium_usd,
+                    COALESCE(SUM(tpa_fee_usd), 0) AS tpa_fee_usd
+                FROM active_member_months
+                GROUP BY GROUPING SETS (
+                    (month_end, network_type),
+                    (month_end, network_group),
+                    (month_end, policy_type)
+                )
+            )
+            SELECT
+                month_end,
+                CASE
+                    WHEN network_type_grouped = 0 THEN 'network_type'
+                    WHEN network_group_grouped = 0 THEN 'network_group'
+                    ELSE 'policy_type'
+                END AS dimension,
+                CASE
+                    WHEN network_type_grouped = 0 THEN COALESCE(network_type, 'Unassigned')
+                    WHEN network_group_grouped = 0 THEN COALESCE(network_group, 'Unassigned')
+                    ELSE COALESCE(policy_type, 'Unassigned')
+                END AS dimension_value,
+                active_population,
+                active_registered_users,
+                gross_premium_usd,
+                net_premium_usd,
+                tpa_fee_usd
+            FROM grouped
+            ORDER BY month_end, dimension, dimension_value
             """
         )
         filter_option_unions = "\nUNION ALL\n".join(
@@ -583,12 +637,68 @@ def _to_frame(
     return connection.execute(sql, list(parameters)).df()
 
 
+def _table_exists(connection: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'main' AND table_name = ?
+        LIMIT 1
+        """,
+        [table_name],
+    ).fetchone()
+    return row is not None
+
+
+def _table_has_columns(
+    connection: duckdb.DuckDBPyConnection,
+    table_name: str,
+    required_columns: set[str],
+) -> bool:
+    """Check whether a materialized table supports the required dashboard metrics."""
+
+    available_columns = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'main' AND table_name = ?
+            """,
+            [table_name],
+        ).fetchall()
+    }
+    return required_columns.issubset(available_columns)
+
+
+def _dimension_population_frame(
+    frame: pd.DataFrame, dimension: str, dimension_column: str
+) -> pd.DataFrame:
+    return (
+        frame.loc[
+            frame["dimension"].eq(dimension),
+            [
+                "month_end",
+                "dimension_value",
+                "active_population",
+                "active_registered_users",
+                "gross_premium_usd",
+                "net_premium_usd",
+                "tpa_fee_usd",
+            ],
+        ]
+        .rename(columns={"dimension_value": dimension_column})
+        .sort_values(["month_end", dimension_column])
+        .reset_index(drop=True)
+    )
+
+
 def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any]:
     """Return all small aggregated tables needed by the dashboard.
 
     A slim scoped temporary table ensures the policy fact table is scanned once
     for the premium, payer, and app views. The larger membership expansion is
-    read only for the active-population chart.
+    read only once for the active-population charts.
     """
 
     started = time.perf_counter()
@@ -604,7 +714,9 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                 service_provider,
                 master_contract,
                 policy_type,
+                network_type,
                 network_group,
+                age_bucket,
                 beneficiary_key,
                 registered_user_key,
                 master_contract_key,
@@ -638,6 +750,12 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
             SELECT
                 uw_year,
                 COUNT(DISTINCT beneficiary_key) AS beneficiaries,
+                COUNT(DISTINCT registered_user_key) AS registered_users,
+                CASE
+                    WHEN COUNT(DISTINCT beneficiary_key) = 0 THEN NULL
+                    ELSE COUNT(DISTINCT registered_user_key) * 1.0
+                         / COUNT(DISTINCT beneficiary_key)
+                END AS app_penetration,
                 SUM(gross_premium_usd) AS gross_premium_usd,
                 SUM(net_premium_usd) AS net_premium_usd,
                 SUM(tpa_fee_usd) AS tpa_fee_usd
@@ -675,6 +793,58 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
             """,
         )
         payer_review = payer_review_all.head(25).copy()
+        payer_network_premium = _to_frame(
+            connection,
+            """
+            SELECT
+                COALESCE(payer_name, 'Unassigned') AS payer_name,
+                COALESCE(network_type, 'Unassigned') AS network_type,
+                COALESCE(SUM(gross_premium_usd), 0) AS gross_premium_usd
+            FROM scoped_policies
+            GROUP BY 1, 2
+            ORDER BY gross_premium_usd DESC NULLS LAST
+            """,
+        )
+        master_contract_network_premium = _to_frame(
+            connection,
+            """
+            SELECT
+                COALESCE(master_contract, 'Unassigned') AS master_contract,
+                COALESCE(network_type, 'Unassigned') AS network_type,
+                COALESCE(SUM(gross_premium_usd), 0) AS gross_premium_usd
+            FROM scoped_policies
+            GROUP BY 1, 2
+            ORDER BY gross_premium_usd DESC NULLS LAST
+            """,
+        )
+        age_bucket_review = _to_frame(
+            connection,
+            """
+            WITH age_bucket_metrics AS (
+                SELECT
+                    COALESCE(age_bucket, 'Unassigned') AS age_bucket,
+                    COUNT(DISTINCT beneficiary_key) AS beneficiaries,
+                    COUNT(DISTINCT registered_user_key) AS registered_users,
+                    COUNT(DISTINCT CASE WHEN registered_user_key IS NOT NULL
+                                        THEN beneficiary_key END) AS registered_beneficiaries,
+                    SUM(gross_premium_usd) AS gross_premium_usd,
+                    SUM(net_premium_usd) AS net_premium_usd,
+                    SUM(tpa_fee_usd) AS tpa_fee_usd
+                FROM scoped_policies
+                GROUP BY 1
+            )
+            SELECT
+                *,
+                CASE WHEN beneficiaries = 0 THEN NULL
+                     ELSE registered_users * 1.0 / beneficiaries END AS app_penetration_rate,
+                CASE WHEN gross_premium_usd = 0 THEN NULL
+                     ELSE net_premium_usd / gross_premium_usd END AS net_to_gross_ratio,
+                CASE WHEN gross_premium_usd = 0 THEN NULL
+                     ELSE tpa_fee_usd / gross_premium_usd END AS tpa_to_gross_ratio
+            FROM age_bucket_metrics
+            ORDER BY beneficiaries DESC NULLS LAST, age_bucket
+            """,
+        )
         policy_type_review = _to_frame(
             connection,
             """
@@ -729,6 +899,18 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
             not filters.has_dimension_filters
             and filters.year_start == min_year
             and filters.year_end == max_year
+            and _table_exists(connection, "monthly_dimension_population_default")
+            and _table_has_columns(
+                connection,
+                "monthly_dimension_population_default",
+                {
+                    "active_population",
+                    "active_registered_users",
+                    "gross_premium_usd",
+                    "net_premium_usd",
+                    "tpa_fee_usd",
+                },
+            )
         )
         if can_use_unfiltered_monthly_kpi_fast_path:
             monthly_kpis = _to_frame(
@@ -752,10 +934,38 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                     month_end,
                     payer_country,
                     active_population,
-                    active_registered_users
+                    active_registered_users,
+                    gross_premium_usd,
+                    net_premium_usd,
+                    tpa_fee_usd
                 FROM monthly_country_kpis_default
                 ORDER BY month_end, payer_country
                 """,
+            )
+            monthly_dimension_population = _to_frame(
+                connection,
+                """
+                SELECT
+                    month_end,
+                    dimension,
+                    dimension_value,
+                    active_population,
+                    active_registered_users,
+                    gross_premium_usd,
+                    net_premium_usd,
+                    tpa_fee_usd
+                FROM monthly_dimension_population_default
+                ORDER BY month_end, dimension, dimension_value
+                """,
+            )
+            monthly_network_type_kpis = _dimension_population_frame(
+                monthly_dimension_population, "network_type", "network_type"
+            )
+            monthly_network_group_kpis = _dimension_population_frame(
+                monthly_dimension_population, "network_group", "network_group"
+            )
+            monthly_policy_type_kpis = _dimension_population_frame(
+                monthly_dimension_population, "policy_type", "policy_type"
             )
         else:
             active_where_sql, active_parameters = _where_clause(filters)
@@ -766,6 +976,9 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                     SELECT
                         month_end,
                         COALESCE(payer_country, 'Unassigned') AS payer_country,
+                        COALESCE(network_type, 'Unassigned') AS network_type,
+                        COALESCE(network_group, 'Unassigned') AS network_group,
+                        COALESCE(policy_type, 'Unassigned') AS policy_type,
                         beneficiary_key,
                         registered_user_key,
                         registration_date,
@@ -778,6 +991,13 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                 SELECT
                     month_end,
                     payer_country,
+                    network_type,
+                    network_group,
+                    policy_type,
+                    GROUPING(payer_country) AS payer_country_grouped,
+                    GROUPING(network_type) AS network_type_grouped,
+                    GROUPING(network_group) AS network_group_grouped,
+                    GROUPING(policy_type) AS policy_type_grouped,
                     COUNT(DISTINCT beneficiary_key) AS active_population,
                     COUNT(DISTINCT CASE
                         WHEN beneficiary_key IS NOT NULL
@@ -789,13 +1009,22 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                     COALESCE(SUM(net_premium_usd), 0) AS net_premium_usd,
                     COALESCE(SUM(tpa_fee_usd), 0) AS tpa_fee_usd
                 FROM scoped_active_months
-                GROUP BY GROUPING SETS ((month_end), (month_end, payer_country))
-                ORDER BY month_end, payer_country
+                GROUP BY GROUPING SETS (
+                    (month_end),
+                    (month_end, payer_country),
+                    (month_end, network_type),
+                    (month_end, network_group),
+                    (month_end, policy_type)
+                )
+                ORDER BY month_end, payer_country, network_type, network_group, policy_type
                 """,
                 active_parameters,
             )
             monthly_kpis = scoped_monthly_metrics.loc[
-                scoped_monthly_metrics["payer_country"].isna(),
+                scoped_monthly_metrics["payer_country_grouped"].eq(1)
+                & scoped_monthly_metrics["network_type_grouped"].eq(1)
+                & scoped_monthly_metrics["network_group_grouped"].eq(1)
+                & scoped_monthly_metrics["policy_type_grouped"].eq(1),
                 [
                     "month_end",
                     "active_population",
@@ -806,12 +1035,51 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
                 ],
             ].reset_index(drop=True)
             monthly_country_kpis = scoped_monthly_metrics.loc[
-                scoped_monthly_metrics["payer_country"].notna(),
+                scoped_monthly_metrics["payer_country_grouped"].eq(0),
                 [
                     "month_end",
                     "payer_country",
                     "active_population",
                     "active_registered_users",
+                    "gross_premium_usd",
+                    "net_premium_usd",
+                    "tpa_fee_usd",
+                ],
+            ].reset_index(drop=True)
+            monthly_network_type_kpis = scoped_monthly_metrics.loc[
+                scoped_monthly_metrics["network_type_grouped"].eq(0),
+                [
+                    "month_end",
+                    "network_type",
+                    "active_population",
+                    "active_registered_users",
+                    "gross_premium_usd",
+                    "net_premium_usd",
+                    "tpa_fee_usd",
+                ],
+            ].reset_index(drop=True)
+            monthly_network_group_kpis = scoped_monthly_metrics.loc[
+                scoped_monthly_metrics["network_group_grouped"].eq(0),
+                [
+                    "month_end",
+                    "network_group",
+                    "active_population",
+                    "active_registered_users",
+                    "gross_premium_usd",
+                    "net_premium_usd",
+                    "tpa_fee_usd",
+                ],
+            ].reset_index(drop=True)
+            monthly_policy_type_kpis = scoped_monthly_metrics.loc[
+                scoped_monthly_metrics["policy_type_grouped"].eq(0),
+                [
+                    "month_end",
+                    "policy_type",
+                    "active_population",
+                    "active_registered_users",
+                    "gross_premium_usd",
+                    "net_premium_usd",
+                    "tpa_fee_usd",
                 ],
             ].reset_index(drop=True)
 
@@ -831,9 +1099,15 @@ def query_dashboard(mart_path: str | Path, filters: FilterSpec) -> dict[str, Any
         "active_population": active_population,
         "monthly_kpis": monthly_kpis,
         "monthly_country_kpis": monthly_country_kpis,
+        "monthly_network_type_kpis": monthly_network_type_kpis,
+        "monthly_network_group_kpis": monthly_network_group_kpis,
+        "monthly_policy_type_kpis": monthly_policy_type_kpis,
         "premium_by_year": premium_by_year,
         "payer_review": payer_review,
         "payer_review_all": payer_review_all,
+        "payer_network_premium": payer_network_premium,
+        "master_contract_network_premium": master_contract_network_premium,
+        "age_bucket_review": age_bucket_review,
         "policy_type_review": policy_type_review,
         "mobile_by_payer": mobile_by_payer,
         "mobile_by_payer_all": mobile_by_payer_all,

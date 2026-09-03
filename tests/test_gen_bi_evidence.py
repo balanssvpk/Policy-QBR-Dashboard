@@ -78,6 +78,27 @@ def _snapshot() -> dict[str, object]:
                 "tpa_to_gross_ratio": [0.05, 0.0512, 0.0481],
             }
         ),
+        "master_contract_network_premium": pd.DataFrame(
+            {
+                "master_contract": ["CIB Families", "CIB Families", "Atlas Corporate"],
+                "network_type": ["GN", "PN", "GN"],
+                "gross_premium_usd": [52000.0, 8000.0, 46000.0],
+            }
+        ),
+        "age_bucket_review": pd.DataFrame(
+            {
+                "age_bucket": ["30-39", "40-49"],
+                "beneficiaries": [55, 45],
+                "registered_users": [28, 40],
+                "registered_beneficiaries": [28, 40],
+                "gross_premium_usd": [65000.0, 55000.0],
+                "net_premium_usd": [57000.0, 49000.0],
+                "tpa_fee_usd": [3300.0, 2700.0],
+                "app_penetration_rate": [28 / 55, 40 / 45],
+                "net_to_gross_ratio": [57 / 65, 49 / 55],
+                "tpa_to_gross_ratio": [3.3 / 65, 2.7 / 55],
+            }
+        ),
         "policy_type_review": pd.DataFrame(
             {
                 "policy_type": ["Group", "Individual"],
@@ -134,6 +155,53 @@ def test_question_evidence_selects_only_named_payer_rows() -> None:
     assert "Cigna" not in json.dumps(context["evidence"])
 
 
+def test_question_evidence_supports_master_contract_and_age_bucket_reviews() -> None:
+    snapshot = _snapshot()
+
+    contract_evidence = build_question_evidence(
+        "Which master contract has the highest gross premium, how concentrated is it by network type, and what should be reviewed before renewal?",
+        snapshot,
+        "All portfolio",
+        entity_catalog={"contracts": ["CIB Families", "Atlas Corporate"]},
+    )
+
+    assert contract_evidence.focus == "Master-contract review"
+    assert "master_contract" in contract_evidence.intents
+    assert set(contract_evidence.tables) == {
+        "summary",
+        "master_contract_network_premium",
+    }
+    assert set(contract_evidence.tables["master_contract_network_premium"].columns) == {
+        "master_contract",
+        "network_type",
+        "gross_premium_usd",
+    }
+    assert set(
+        contract_evidence.tables["master_contract_network_premium"]["master_contract"]
+    ) == {"CIB Families", "Atlas Corporate"}
+
+    age_bucket_evidence = build_question_evidence(
+        "Which age bucket has the lowest app penetration, how large is the beneficiary opportunity, and what engagement should be prioritised?",
+        snapshot,
+        "All portfolio",
+        entity_catalog={"age_buckets": ["30-39", "40-49"]},
+    )
+
+    assert age_bucket_evidence.focus == "Age-bucket demographic review"
+    assert {"adoption", "demographic"}.issubset(age_bucket_evidence.intents)
+    assert set(age_bucket_evidence.tables) == {"summary", "age_bucket_review"}
+    assert set(age_bucket_evidence.tables["age_bucket_review"].columns) == {
+        "age_bucket",
+        "beneficiaries",
+        "registered_users",
+        "app_penetration_rate",
+    }
+    assert set(age_bucket_evidence.tables["age_bucket_review"]["age_bucket"]) == {
+        "30-39",
+        "40-49",
+    }
+
+
 def test_record_evaluation_writes_aggregate_parquet_row(tmp_path: Path) -> None:
     snapshot = _snapshot()
     evidence = build_question_evidence(
@@ -150,6 +218,7 @@ def test_record_evaluation_writes_aggregate_parquet_row(tmp_path: Path) -> None:
         response_engine="ollama:llama3.2:1b",
         response_status="success",
         configured_model="llama3.2:1b",
+        generation_profile="greedy-seed-42-v1",
         model_check_status="narrative_responded",
         filter_spec_json='{"payer_countries":["Egypt"]}',
         planning_ms=1.5,
@@ -164,6 +233,7 @@ def test_record_evaluation_writes_aggregate_parquet_row(tmp_path: Path) -> None:
     assert saved.loc[0, "answer"].startswith("**Executive answer**")
     assert saved.loc[0, "response_status"] == "success"
     assert saved.loc[0, "configured_model"] == "llama3.2:1b"
+    assert saved.loc[0, "generation_profile"] == "greedy-seed-42-v1"
     assert saved.loc[0, "model_check_status"] == "narrative_responded"
     assert pd.notna(saved.loc[0, "timestamp_utc"])
 
